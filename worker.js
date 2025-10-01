@@ -6,13 +6,28 @@ import { PDFLoader } from '@langchain/community/document_loaders/fs/pdf';
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 import OpenAI from 'openai';
 import express from 'express';
+import cors from 'cors';
 import fs from 'fs';
 import dotenv from 'dotenv';
+import { createClient } from '@supabase/supabase-js';
+import { redisConnection } from './redis-config.js';
+import { Redis } from '@upstash/redis';
 
 dotenv.config();
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
+});
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_ANON_KEY
+);
+
+// Initialize Redis client for data storage
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
 // ========== AI-POWERED DOCUMENT ANALYSIS ==========
@@ -69,6 +84,174 @@ Return JSON:
   }
 }
 
+// ========== INVOICE ANALYSIS WITH AI ==========
+
+async function analyzeInvoiceWithAI(content, filename) {
+  try {
+    if (!content || content.trim().length < 50) {
+      console.error('[Invoice AI] ERROR: Content too short or empty');
+      throw new Error('PDF content is empty or too short to analyze');
+    }
+
+    console.log(`[Invoice AI] Starting analysis for: ${filename}`);
+    console.log(`[Invoice AI] Content length: ${content.length} characters`);
+    
+    const contentToAnalyze = content.substring(0, 8000);
+    
+    const prompt = `Analyze this invoice/shipping document and extract ALL relevant information.
+
+Filename: ${filename}
+
+Document Content:
+${contentToAnalyze}
+
+Extract and return JSON with ALL available fields:
+{
+  "documentType": "Commercial Invoice|Proforma Invoice|Bill of Lading|Packing List|Certificate of Origin|Air Waybill|Sea Waybill|Customs Declaration|Insurance Certificate|Delivery Order|Other",
+  "confidence": 0.0-1.0,
+  "invoiceDetails": {
+    "invoiceNumber": "string or null",
+    "invoiceDate": "YYYY-MM-DD or null",
+    "dueDate": "YYYY-MM-DD or null",
+    "poNumber": "string or null",
+    "currency": "USD|EUR|INR|etc or null"
+  },
+  "seller": {
+    "name": "string or null",
+    "address": "string or null",
+    "city": "string or null",
+    "country": "string or null",
+    "taxId": "string or null",
+    "contact": "string or null",
+    "email": "string or null",
+    "phone": "string or null"
+  },
+  "buyer": {
+    "name": "string or null",
+    "address": "string or null",
+    "city": "string or null",
+    "country": "string or null",
+    "taxId": "string or null",
+    "contact": "string or null",
+    "email": "string or null",
+    "phone": "string or null"
+  },
+  "shipmentDetails": {
+    "portOfLoading": "string or null",
+    "portOfDischarge": "string or null",
+    "placeOfDelivery": "string or null",
+    "countryOfOrigin": "string or null",
+    "countryOfDestination": "string or null",
+    "vessel": "string or null",
+    "voyageNumber": "string or null",
+    "containerNumber": "string or null",
+    "sealNumber": "string or null",
+    "bookingNumber": "string or null",
+    "blNumber": "string or null"
+  },
+  "cargoDetails": {
+    "description": "string or null",
+    "hsCode": "string or null",
+    "quantity": "number or null",
+    "unit": "string or null",
+    "grossWeight": "string or null",
+    "netWeight": "string or null",
+    "volume": "string or null",
+    "packages": "number or null",
+    "packageType": "string or null"
+  },
+  "financials": {
+    "subtotal": "number or null",
+    "taxAmount": "number or null",
+    "shippingCost": "number or null",
+    "insuranceCost": "number or null",
+    "totalAmount": "number or null",
+    "currency": "string or null",
+    "paymentTerms": "string or null",
+    "incoterms": "FOB|CIF|EXW|DDP|etc or null"
+  },
+  "items": [
+    {
+      "itemNumber": "string",
+      "description": "string",
+      "quantity": "number",
+      "unitPrice": "number",
+      "totalPrice": "number"
+    }
+  ],
+  "compliance": {
+    "customsValue": "number or null",
+    "exportLicense": "string or null",
+    "certificateNumber": "string or null",
+    "inspectionDate": "string or null"
+  },
+  "validation": {
+    "isComplete": boolean,
+    "missingCriticalFields": ["array of missing fields"],
+    "complianceScore": 0.0-1.0,
+    "readyForBooking": boolean
+  },
+  "extractedText": "key information summary"
+}
+
+IMPORTANT: Return ONLY valid JSON. No markdown, no code blocks, just pure JSON.`;
+
+    console.log('[Invoice AI] Calling OpenAI API...');
+    
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [
+        { 
+          role: 'system', 
+          content: 'You are an expert in shipping documents and invoice processing. Extract ALL available information accurately. Return ONLY valid JSON, no markdown formatting.' 
+        },
+        { role: 'user', content: prompt }
+      ],
+      temperature: 0.1,
+      max_tokens: 3000,
+    });
+
+    const responseContent = response.choices[0].message.content;
+    
+    let jsonString = responseContent.trim();
+    if (jsonString.startsWith('```')) {
+      jsonString = jsonString.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+    }
+    
+    const analysis = JSON.parse(jsonString);
+    console.log('[Invoice AI] ✓ Analysis completed successfully');
+    
+    return analysis;
+    
+  } catch (error) {
+    console.error('[Invoice AI] ✗ CRITICAL ERROR:', error.message);
+    
+    return {
+      documentType: 'Unknown',
+      confidence: 0.2,
+      invoiceDetails: {},
+      seller: {},
+      buyer: {},
+      shipmentDetails: {},
+      cargoDetails: {},
+      financials: {},
+      items: [],
+      compliance: {},
+      validation: {
+        isComplete: false,
+        missingCriticalFields: [`Analysis failed: ${error.message}`],
+        complianceScore: 0.0,
+        readyForBooking: false
+      },
+      extractedText: `Analysis failed: ${error.message}`,
+      _error: {
+        message: error.message,
+        timestamp: new Date().toISOString()
+      }
+    };
+  }
+}
+
 // ========== PDF PROCESSING WORKER ==========
 
 const pdfWorker = new Worker(
@@ -89,18 +272,15 @@ const pdfWorker = new Worker(
       const fileSize = fs.statSync(filePath).size;
       console.log(`[PDF Worker] Loading ${filename} (${(fileSize / 1024).toFixed(2)} KB)`);
 
-      // Load PDF
       const loader = new PDFLoader(filePath);
       const docs = await loader.load();
       console.log(`[PDF Worker] Loaded ${docs.length} pages`);
 
-      // AI-powered document analysis
       const fullText = docs.map(doc => doc.pageContent).join('\n');
       console.log(`[PDF Worker] Running AI analysis...`);
       const aiAnalysis = await analyzeDocumentWithAI(fullText, filename);
       console.log(`[PDF Worker] Detected: ${aiAnalysis.documentType} (confidence: ${aiAnalysis.confidence})`);
 
-      // Text splitting with optimal parameters
       const splitter = new RecursiveCharacterTextSplitter({
         chunkSize: 1000,
         chunkOverlap: 200,
@@ -110,7 +290,6 @@ const pdfWorker = new Worker(
       const splitDocs = await splitter.splitDocuments(docs);
       console.log(`[PDF Worker] Split into ${splitDocs.length} chunks`);
 
-      // Enhance metadata with AI analysis
       const enrichedDocs = splitDocs.map((doc, index) => {
         return new Document({
           pageContent: doc.pageContent,
@@ -123,8 +302,6 @@ const pdfWorker = new Worker(
             userId,
             strategy,
             processedAt: new Date().toISOString(),
-            
-            // AI-enriched metadata
             documentType: aiAnalysis.documentType,
             language: aiAnalysis.language,
             confidence: aiAnalysis.confidence,
@@ -132,14 +309,12 @@ const pdfWorker = new Worker(
             topics: aiAnalysis.topics,
             sentiment: aiAnalysis.sentiment,
             entities: aiAnalysis.keyEntities,
-            
             fileSize,
-            processingVersion: '4.0.0-agent'
+            processingVersion: '5.2.0-free'
           },
         });
       });
 
-      // Initialize embeddings
       const embeddings = new OpenAIEmbeddings({
         model: 'text-embedding-3-small',
         apiKey: process.env.OPENAI_API_KEY,
@@ -149,7 +324,6 @@ const pdfWorker = new Worker(
 
       console.log(`[PDF Worker] Creating vector store: ${collectionName}`);
 
-      // Clear collection for 'document' strategy
       if (strategy === 'document') {
         try {
           const tmpStore = new QdrantVectorStore(embeddings, {
@@ -165,7 +339,6 @@ const pdfWorker = new Worker(
         }
       }
 
-      // Create vector store
       const vectorStore = await QdrantVectorStore.fromDocuments(
         [],
         embeddings,
@@ -183,7 +356,6 @@ const pdfWorker = new Worker(
         }
       );
 
-      // Batch insert with progress tracking
       const batchSize = 25;
       let processedChunks = 0;
       
@@ -200,7 +372,42 @@ const pdfWorker = new Worker(
         }
       }
 
-      // Cleanup
+      // ========== SAVE TO REDIS ==========
+      try {
+        const redisKey = `document:${documentId}`;
+        const redisData = {
+          documentId,
+          userId,
+          filename,
+          collectionName,
+          strategy,
+          fileSize,
+          totalPages: docs.length,
+          totalChunks: processedChunks,
+          aiAnalysis,
+          processedAt: new Date().toISOString(),
+          version: '5.2.0-free'
+        };
+
+        await redis.set(redisKey, JSON.stringify(redisData));
+        
+        // Also add to user's document list
+        await redis.sadd(`user:${userId}:documents`, documentId);
+        
+        // Store document metadata for quick listing
+        await redis.hset(`user:${userId}:doc_metadata`, {
+          [documentId]: JSON.stringify({
+            filename,
+            documentType: aiAnalysis.documentType,
+            processedAt: new Date().toISOString()
+          })
+        });
+
+        console.log(`[PDF Worker] ✓ Saved to Redis: ${redisKey}`);
+      } catch (redisError) {
+        console.warn(`[PDF Worker] Redis save failed:`, redisError.message);
+      }
+
       try {
         fs.unlinkSync(filePath);
         console.log(`[PDF Worker] Cleaned up file: ${filePath}`);
@@ -219,13 +426,12 @@ const pdfWorker = new Worker(
         strategy,
         aiAnalysis,
         processingTime,
-        version: '4.0.0-agent'
+        version: '5.2.0-free'
       };
 
     } catch (err) {
       console.error(`[PDF Worker] Job ${job.id} failed:`, err);
       
-      // Cleanup on failure
       try {
         const filePath = typeof job.data === 'string' ? JSON.parse(job.data).path : job.data.path;
         if (filePath && fs.existsSync(filePath)) {
@@ -237,11 +443,8 @@ const pdfWorker = new Worker(
     }
   },
   {
-    concurrency: 3,
-    connection: {
-      host: process.env.REDIS_HOST || '127.0.0.1',
-      port: parseInt(process.env.REDIS_PORT) || 6379,
-    },
+    concurrency: 2,
+    connection: redisConnection,
     limiter: {
       max: 10,
       duration: 60000,
@@ -258,121 +461,153 @@ const pdfWorker = new Worker(
   }
 );
 
-// ========== SHIPPING DOCUMENT WORKER ==========
+// ========== INVOICE PROCESSING WORKER ==========
 
-async function analyzeShippingDocumentWithAI(content, filename) {
-  try {
-    const prompt = `Analyze this shipping/logistics document and extract structured information.
-
-Filename: ${filename}
-Content: ${content}
-
-Return JSON:
-{
-  "documentType": "Commercial Invoice|Bill of Lading|Packing List|Certificate of Origin|Air Waybill|Customs Declaration|Insurance Certificate|Unknown",
-  "confidence": 0.0-1.0,
-  "extractedData": {
-    "invoiceNumber": "string or null",
-    "shipperName": "string or null",
-    "shipperAddress": "string or null",
-    "consigneeName": "string or null",
-    "consigneeAddress": "string or null",
-    "portOfLoading": "string or null",
-    "portOfDischarge": "string or null",
-    "totalValue": "string or null",
-    "currency": "string or null",
-    "incoterms": "string or null",
-    "weight": "string or null",
-    "vessel": "string or null"
-  },
-  "validation": {
-    "isComplete": boolean,
-    "missingFields": ["array"],
-    "complianceScore": 0.0-1.0
-  },
-  "summary": "brief summary"
-}`;
-
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4o',
-      messages: [
-        { 
-          role: 'system', 
-          content: 'You are a shipping document analysis expert. Extract structured data accurately.' 
-        },
-        { role: 'user', content: prompt }
-      ],
-      temperature: 0.1,
-      max_tokens: 2000,
-    });
-
-    const analysis = JSON.parse(response.choices[0].message.content);
-    return analysis;
-  } catch (error) {
-    console.warn('Shipping document AI analysis failed:', error.message);
-    return {
-      documentType: 'Unknown',
-      confidence: 0.2,
-      extractedData: {},
-      validation: {
-        isComplete: false,
-        missingFields: ['Analysis failed'],
-        complianceScore: 0.0
-      },
-      summary: 'Analysis unavailable'
-    };
-  }
-}
-
-const shippingWorker = new Worker(
-  'shipping-document-queue',
+const invoiceWorker = new Worker(
+  'invoice-upload-queue',
   async (job) => {
     const startTime = Date.now();
     
     try {
-      console.log(`[Shipping Worker] Processing job ${job.id}`);
+      console.log(`\n========================================`);
+      console.log(`[Invoice Worker] Processing job ${job.id}`);
+      console.log(`========================================`);
+      
       const data = typeof job.data === 'string' ? JSON.parse(job.data) : job.data;
+      const { path: filePath, filename, invoiceId, userId, sessionId, bookingId } = data;
 
-      const { path: filePath, filename, sessionId, documentId, userId } = data;
+      console.log(`[Invoice Worker] File: ${filename}`);
+      console.log(`[Invoice Worker] Invoice ID: ${invoiceId}`);
 
       if (!fs.existsSync(filePath)) {
         throw new Error(`File not found: ${filePath}`);
       }
 
-      console.log(`[Shipping Worker] Loading ${filename}`);
+      const fileSize = fs.statSync(filePath).size;
+      console.log(`[Invoice Worker] File size: ${(fileSize / 1024).toFixed(2)} KB`);
+
+      console.log(`[Invoice Worker] Loading PDF...`);
       const loader = new PDFLoader(filePath);
       const docs = await loader.load();
+      console.log(`[Invoice Worker] ✓ Loaded ${docs.length} pages`);
 
-      const fullContent = docs.map(doc => doc.pageContent).join('\n');
-      console.log(`[Shipping Worker] Running AI analysis...`);
+      if (docs.length === 0) {
+        throw new Error('PDF has no pages or could not be read');
+      }
+
+      const fullContent = docs.map(doc => doc.pageContent).join('\n\n');
+      console.log(`[Invoice Worker] Extracted text length: ${fullContent.length} characters`);
       
-      const analysis = await analyzeShippingDocumentWithAI(fullContent, filename);
-      console.log(`[Shipping Worker] Detected: ${analysis.documentType} (${analysis.confidence})`);
+      if (fullContent.length < 50) {
+        throw new Error('PDF content is empty or unreadable');
+      }
 
-      // Store in vector database for retrieval
-      const embeddings = new OpenAIEmbeddings({
-        model: 'text-embedding-3-small',
-        apiKey: process.env.OPENAI_API_KEY,
-      });
-
-      const collectionName = `shipping_docs_${userId}`;
+      console.log(`[Invoice Worker] Starting AI analysis...`);
+      const analysis = await analyzeInvoiceWithAI(fullContent, filename);
       
-      const analyzedDoc = new Document({
-        pageContent: fullContent,
-        metadata: {
-          source: filename,
-          sessionId,
-          documentId,
+      console.log(`\n[Invoice Worker] ========== ANALYSIS RESULTS ==========`);
+      console.log(`[Invoice Worker] Document Type: ${analysis.documentType}`);
+      console.log(`[Invoice Worker] Confidence: ${analysis.confidence}`);
+      console.log(`[Invoice Worker] Ready for Booking: ${analysis.validation.readyForBooking}`);
+      console.log(`[Invoice Worker] ======================================\n`);
+
+      console.log(`[Invoice Worker] Updating database...`);
+      const { data: updateData, error: updateError } = await supabase
+        .from('invoices')
+        .update({
+          processed: true,
+          document_type: analysis.documentType,
+          extracted_data: analysis,
+          processed_at: new Date().toISOString()
+        })
+        .eq('invoice_id', invoiceId)
+        .select()
+        .single();
+
+      if (updateError) {
+        throw updateError;
+      }
+      
+      console.log(`[Invoice Worker] ✓ Database updated successfully`);
+
+      // ========== SAVE TO REDIS ==========
+      try {
+        const redisKey = `invoice:${invoiceId}`;
+        const redisData = {
+          invoiceId,
           userId,
-          type: 'shipping_document',
-          analysis: analysis,
+          sessionId,
+          bookingId,
+          filename,
+          fileSize,
+          totalPages: docs.length,
+          analysis,
           processedAt: new Date().toISOString(),
-          fileSize: fs.statSync(filePath).size,
-          version: '4.0.0-agent'
-        },
-      });
+          version: '5.2.0-free'
+        };
+
+        await redis.set(redisKey, JSON.stringify(redisData));
+        
+        // Add to user's invoice list
+        await redis.sadd(`user:${userId}:invoices`, invoiceId);
+        
+        // Add to session's invoice list if sessionId exists
+        if (sessionId) {
+          await redis.sadd(`session:${sessionId}:invoices`, invoiceId);
+        }
+        
+        // Add to booking's invoice list if bookingId exists
+        if (bookingId) {
+          await redis.sadd(`booking:${bookingId}:invoices`, invoiceId);
+        }
+        
+        // Store invoice metadata for quick listing
+        await redis.hset(`user:${userId}:invoice_metadata`, {
+          [invoiceId]: JSON.stringify({
+            filename,
+            documentType: analysis.documentType,
+            invoiceNumber: analysis.invoiceDetails?.invoiceNumber,
+            totalAmount: analysis.financials?.totalAmount,
+            currency: analysis.financials?.currency,
+            processedAt: new Date().toISOString(),
+            readyForBooking: analysis.validation?.readyForBooking
+          })
+        });
+
+        // Store latest invoice for quick access
+        await redis.set(`user:${userId}:latest_invoice`, invoiceId);
+
+        console.log(`[Invoice Worker] ✓ Saved to Redis: ${redisKey}`);
+      } catch (redisError) {
+        console.warn(`[Invoice Worker] Redis save failed:`, redisError.message);
+      }
 
       try {
+        console.log(`[Invoice Worker] Creating vector embeddings...`);
+        const embeddings = new OpenAIEmbeddings({
+          model: 'text-embedding-3-small',
+          apiKey: process.env.OPENAI_API_KEY,
+        });
+
+        const collectionName = `invoices_${userId}`;
+        
+        const invoiceDoc = new Document({
+          pageContent: fullContent,
+          metadata: {
+            source: filename,
+            invoiceId,
+            sessionId,
+            bookingId,
+            userId,
+            type: 'invoice',
+            documentType: analysis.documentType,
+            analysis: analysis,
+            processedAt: new Date().toISOString(),
+            fileSize,
+            version: '5.2.0-free'
+          },
+        });
+
         const vectorStore = await QdrantVectorStore.fromDocuments(
           [],
           embeddings,
@@ -384,36 +619,53 @@ const shippingWorker = new Worker(
           }
         );
 
-        await vectorStore.addDocuments([analyzedDoc]);
-        console.log(`[Shipping Worker] Stored in collection: ${collectionName}`);
-      } catch (error) {
-        console.warn(`[Shipping Worker] Vector storage failed: ${error.message}`);
+        await vectorStore.addDocuments([invoiceDoc]);
+        console.log(`[Invoice Worker] ✓ Vector embeddings created`);
+      } catch (vectorError) {
+        console.warn(`[Invoice Worker] Vector storage failed:`, vectorError.message);
       }
 
-      // Cleanup
       try {
         fs.unlinkSync(filePath);
-        console.log(`[Shipping Worker] Cleaned up file`);
+        console.log(`[Invoice Worker] ✓ Cleaned up file`);
       } catch (err) {
-        console.warn(`[Shipping Worker] Could not delete file: ${err.message}`);
+        console.warn(`[Invoice Worker] Could not delete file: ${err.message}`);
       }
 
       const processingTime = Date.now() - startTime;
-      console.log(`[Shipping Worker] ✓ Completed in ${processingTime}ms`);
+      console.log(`\n[Invoice Worker] ✓✓✓ COMPLETED IN ${processingTime}ms ✓✓✓\n`);
 
       return {
         success: true,
         filename,
+        invoiceId,
         sessionId,
-        documentId,
+        bookingId,
         analysis,
-        collectionName,
+        collectionName: `invoices_${userId}`,
         processingTime,
-        version: '4.0.0-agent'
+        version: '5.2.0-free'
       };
 
     } catch (err) {
-      console.error(`[Shipping Worker] Job ${job.id} failed:`, err);
+      console.error(`\n[Invoice Worker] ✗✗✗ JOB FAILED ✗✗✗`);
+      console.error(`[Invoice Worker] Error:`, err.message);
+      
+      try {
+        const data = typeof job.data === 'string' ? JSON.parse(job.data) : job.data;
+        await supabase
+          .from('invoices')
+          .update({
+            processed: false,
+            extracted_data: { 
+              error: err.message,
+              timestamp: new Date().toISOString()
+            }
+          })
+          .eq('invoice_id', data.invoiceId);
+      } catch (dbErr) {
+        console.error(`[Invoice Worker] Could not update database:`, dbErr.message);
+      }
       
       try {
         const filePath = typeof job.data === 'string' ? JSON.parse(job.data).path : job.data.path;
@@ -426,11 +678,8 @@ const shippingWorker = new Worker(
     }
   },
   {
-    concurrency: 2,
-    connection: {
-      host: process.env.REDIS_HOST || '127.0.0.1',
-      port: parseInt(process.env.REDIS_PORT) || 6379,
-    },
+    concurrency: 1,
+    connection: redisConnection,
     limiter: {
       max: 5,
       duration: 60000,
@@ -450,41 +699,44 @@ const shippingWorker = new Worker(
 // ========== EVENT HANDLERS ==========
 
 pdfWorker.on('completed', (job, result) => {
-  console.log(`[PDF Worker] ✓ Job ${job.id} completed: ${result.filename} (${result.chunks} chunks, ${result.processingTime}ms)`);
+  console.log(`[PDF Worker] ✓ Job ${job.id} completed: ${result.filename}`);
 });
 
 pdfWorker.on('failed', (job, err) => {
   console.error(`[PDF Worker] ✗ Job ${job?.id} failed: ${err.message}`);
 });
 
-pdfWorker.on('stalled', (job) => {
-  console.warn(`[PDF Worker] ⚠ Job ${job.id} stalled`);
+invoiceWorker.on('completed', (job, result) => {
+  console.log(`[Invoice Worker] ✓ Job ${job.id} completed: ${result.filename}`);
 });
 
-shippingWorker.on('completed', (job, result) => {
-  console.log(`[Shipping Worker] ✓ Job ${job.id} completed: ${result.filename} (${result.analysis.documentType})`);
-});
-
-shippingWorker.on('failed', (job, err) => {
-  console.error(`[Shipping Worker] ✗ Job ${job?.id} failed: ${err.message}`);
-});
-
-shippingWorker.on('stalled', (job) => {
-  console.warn(`[Shipping Worker] ⚠ Job ${job.id} stalled`);
+invoiceWorker.on('failed', (job, err) => {
+  console.error(`[Invoice Worker] ✗ Job ${job?.id} failed: ${err.message}`);
 });
 
 // ========== HEALTH MONITORING ==========
 
 setInterval(() => {
   const pdfStatus = pdfWorker.isRunning() ? '✓ Running' : '✗ Stopped';
-  const shippingStatus = shippingWorker.isRunning() ? '✓ Running' : '✗ Stopped';
-  console.log(`[Workers] PDF: ${pdfStatus} | Shipping: ${shippingStatus}`);
+  const invoiceStatus = invoiceWorker.isRunning() ? '✓ Running' : '✗ Stopped';
+  console.log(`[Workers] PDF: ${pdfStatus} | Invoice: ${invoiceStatus}`);
 }, 60000);
 
-// ========== HEALTH CHECK API ==========
+// ========== HEALTH CHECK API WITH CORS ==========
 
 const workerApp = express();
 const WORKER_PORT = process.env.WORKER_PORT || 8001;
+
+// ========== CRITICAL: ADD CORS MIDDLEWARE ==========
+workerApp.use(cors({
+  origin: ['http://localhost:3000', 'http://localhost:3001'],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+// Add JSON body parser
+workerApp.use(express.json());
 
 workerApp.get('/health', (req, res) => {
   res.json({
@@ -494,119 +746,86 @@ workerApp.get('/health', (req, res) => {
         name: 'PDF Processing',
         queue: 'file-upload-queue',
         status: pdfWorker.isRunning() ? 'running' : 'stopped',
-        concurrency: 3,
-        features: ['AI Document Analysis', 'Vector Embedding', 'Metadata Enrichment']
+        concurrency: 2
       },
       {
-        name: 'Shipping Documents',
-        queue: 'shipping-document-queue', 
-        status: shippingWorker.isRunning() ? 'running' : 'stopped',
-        concurrency: 2,
-        features: ['AI Extraction', 'Compliance Validation', 'Data Structuring']
+        name: 'Invoice Processing',
+        queue: 'invoice-upload-queue', 
+        status: invoiceWorker.isRunning() ? 'running' : 'stopped',
+        concurrency: 1
       }
     ],
+    redis: 'Upstash Connected',
+    deployment: 'Render Free Tier',
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
-    version: '4.0.0-agent',
-    architecture: 'Agent-Based with AI Enhancement'
+    version: '5.2.0-free'
   });
 });
 
-workerApp.get('/stats', async (req, res) => {
-  try {
-    const pdfQueue = pdfWorker.queue;
-    const shippingQueue = shippingWorker.queue;
-    
-    const [pdfWaiting, pdfActive, pdfCompleted, pdfFailed] = await Promise.all([
-      pdfQueue.getWaiting(),
-      pdfQueue.getActive(),
-      pdfQueue.getCompleted(),
-      pdfQueue.getFailed()
-    ]);
-    
-    const [shipWaiting, shipActive, shipCompleted, shipFailed] = await Promise.all([
-      shippingQueue.getWaiting(),
-      shippingQueue.getActive(),
-      shippingQueue.getCompleted(),
-      shippingQueue.getFailed()
-    ]);
+// ========== REDIS DATA RETRIEVAL ENDPOINTS ==========
 
-    res.json({
-      pdfProcessing: {
-        waiting: pdfWaiting.length,
-        active: pdfActive.length,
-        completed: pdfCompleted.length,
-        failed: pdfFailed.length,
-        total: pdfWaiting.length + pdfActive.length + pdfCompleted.length + pdfFailed.length
-      },
-      shippingDocuments: {
-        waiting: shipWaiting.length,
-        active: shipActive.length,
-        completed: shipCompleted.length,
-        failed: shipFailed.length,
-        total: shipWaiting.length + shipActive.length + shipCompleted.length + shipFailed.length
-      },
-      timestamp: new Date().toISOString()
-    });
+workerApp.get('/api/invoice/:invoiceId', async (req, res) => {
+  try {
+    const { invoiceId } = req.params;
+    const data = await redis.get(`invoice:${invoiceId}`);
+    
+    if (!data) {
+      return res.status(404).json({ error: 'Invoice not found in Redis' });
+    }
+    
+    res.json(JSON.parse(data));
   } catch (error) {
-    res.status(500).json({ 
-      error: 'Failed to fetch stats', 
-      message: error.message 
-    });
+    res.status(500).json({ error: error.message });
   }
 });
 
-workerApp.get('/jobs/pdf/recent', async (req, res) => {
+workerApp.get('/api/document/:documentId', async (req, res) => {
   try {
-    const limit = parseInt(req.query.limit) || 10;
-    const completed = await pdfWorker.queue.getCompleted(0, limit - 1);
-    const failed = await pdfWorker.queue.getFailed(0, limit - 1);
+    const { documentId } = req.params;
+    const data = await redis.get(`document:${documentId}`);
     
-    res.json({
-      completed: completed.map(job => ({
-        id: job.id,
-        name: job.name,
-        data: job.data,
-        returnvalue: job.returnvalue,
-        finishedOn: job.finishedOn
-      })),
-      failed: failed.map(job => ({
-        id: job.id,
-        name: job.name,
-        data: job.data,
-        failedReason: job.failedReason,
-        failedOn: job.finishedOn
-      }))
-    });
+    if (!data) {
+      return res.status(404).json({ error: 'Document not found in Redis' });
+    }
+    
+    res.json(JSON.parse(data));
   } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch jobs' });
+    res.status(500).json({ error: error.message });
   }
 });
 
-workerApp.get('/jobs/shipping/recent', async (req, res) => {
+workerApp.get('/api/user/:userId/invoices', async (req, res) => {
   try {
-    const limit = parseInt(req.query.limit) || 10;
-    const completed = await shippingWorker.queue.getCompleted(0, limit - 1);
-    const failed = await shippingWorker.queue.getFailed(0, limit - 1);
+    const { userId } = req.params;
+    const invoiceIds = await redis.smembers(`user:${userId}:invoices`);
+    const metadata = await redis.hgetall(`user:${userId}:invoice_metadata`);
     
-    res.json({
-      completed: completed.map(job => ({
-        id: job.id,
-        name: job.name,
-        data: job.data,
-        returnvalue: job.returnvalue,
-        finishedOn: job.finishedOn
-      })),
-      failed: failed.map(job => ({
-        id: job.id,
-        name: job.name,
-        data: job.data,
-        failedReason: job.failedReason,
-        failedOn: job.finishedOn
-      }))
-    });
+    const invoices = invoiceIds.map(id => ({
+      invoiceId: id,
+      ...JSON.parse(metadata[id] || '{}')
+    }));
+    
+    res.json({ userId, invoices });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch jobs' });
+    res.status(500).json({ error: error.message });
+  }
+});
+
+workerApp.get('/api/user/:userId/documents', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const documentIds = await redis.smembers(`user:${userId}:documents`);
+    const metadata = await redis.hgetall(`user:${userId}:doc_metadata`);
+    
+    const documents = documentIds.map(id => ({
+      documentId: id,
+      ...JSON.parse(metadata[id] || '{}')
+    }));
+    
+    res.json({ userId, documents });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -614,22 +833,21 @@ workerApp.listen(WORKER_PORT, () => {
   console.log('========================================');
   console.log('FreightChat Pro Workers Started');
   console.log('========================================');
-  console.log(`Version: 4.0.0-agent`);
-  console.log(`Architecture: Agent-Based AI Processing`);
+  console.log(`Version: 5.2.0-free-deployment`);
   console.log(`Health Check: http://localhost:${WORKER_PORT}/health`);
-  console.log(`Statistics: http://localhost:${WORKER_PORT}/stats`);
-  console.log(`Recent PDF Jobs: http://localhost:${WORKER_PORT}/jobs/pdf/recent`);
-  console.log(`Recent Shipping Jobs: http://localhost:${WORKER_PORT}/jobs/shipping/recent`);
+  console.log(`Redis: Upstash Connected (with data storage)`);
+  console.log(`Deployment: Render Free Tier Ready`);
+  console.log(`CORS: Enabled for localhost:3000, localhost:3001`);
   console.log('========================================');
   console.log('Active Workers:');
-  console.log('  ✓ PDF Processing (3 concurrent)');
-  console.log('    - AI document analysis');
-  console.log('    - Vector embedding generation');
-  console.log('    - Intelligent metadata extraction');
-  console.log('  ✓ Shipping Documents (2 concurrent)');
-  console.log('    - AI data extraction');
-  console.log('    - Compliance validation');
-  console.log('    - Structured data output');
+  console.log('  ✓ PDF Processing (2 concurrent)');
+  console.log('  ✓ Invoice Processing (1 concurrent)');
+  console.log('========================================');
+  console.log('API Endpoints:');
+  console.log('  GET /api/invoice/:invoiceId');
+  console.log('  GET /api/document/:documentId');
+  console.log('  GET /api/user/:userId/invoices');
+  console.log('  GET /api/user/:userId/documents');
   console.log('========================================');
   console.log('Ready to process jobs...');
 });
@@ -642,7 +860,7 @@ async function gracefulShutdown() {
   try {
     await Promise.all([
       pdfWorker.close(),
-      shippingWorker.close()
+      invoiceWorker.close()
     ]);
     console.log('[Shutdown] ✓ Workers closed successfully');
     process.exit(0);
@@ -655,15 +873,4 @@ async function gracefulShutdown() {
 process.on('SIGINT', gracefulShutdown);
 process.on('SIGTERM', gracefulShutdown);
 
-// Handle uncaught errors
-process.on('uncaughtException', (error) => {
-  console.error('[Fatal] Uncaught exception:', error);
-  gracefulShutdown();
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('[Fatal] Unhandled rejection at:', promise, 'reason:', reason);
-  gracefulShutdown();
-});
-
-console.log('Workers initialized and ready for agent-based processing!');
+console.log('Workers initialized and ready!');

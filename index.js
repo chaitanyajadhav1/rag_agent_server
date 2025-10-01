@@ -11,6 +11,7 @@ import jwt from 'jsonwebtoken';
 import { createClient } from '@supabase/supabase-js';
 import { MemorySaver } from '@langchain/langgraph';
 import { createShippingAgent, ShippingAgentExecutor } from './workflow.js';
+import { redisConnection } from './redis-config.js';
 
 dotenv.config();
 
@@ -41,14 +42,16 @@ createShippingAgent(checkpointer)
     console.error('Stack:', error.stack);
   });
 
+// BullMQ Queues with Upstash Redis connection
 const queue = new Queue('file-upload-queue', {
-  connection: {
-    host: process.env.REDIS_HOST || '127.0.0.1',
-    port: parseInt(process.env.REDIS_PORT) || 6379,
-  },
+  connection: redisConnection
 });
 
-console.log('✓ BullMQ queue initialized');
+const invoiceQueue = new Queue('invoice-upload-queue', {
+  connection: redisConnection
+});
+
+console.log('✓ BullMQ queues initialized with Upstash Redis');
 
 const uploadsDir = 'uploads';
 if (!fs.existsSync(uploadsDir)) {
@@ -77,7 +80,16 @@ const upload = multer({
 });
 
 const app = express();
-app.use(cors());
+
+// CORS configuration for deployment
+const corsOptions = {
+  origin: process.env.FRONTEND_URL 
+    ? [process.env.FRONTEND_URL, 'http://localhost:3000']
+    : '*',
+  credentials: true
+};
+
+app.use(cors(corsOptions));
 app.use(express.json());
 
 console.log('✓ Express middleware configured');
@@ -183,6 +195,38 @@ async function createShipmentTracking(bookingData) {
   return data;
 }
 
+async function createInvoiceRecord(invoiceData) {
+  const { data, error } = await supabase
+    .from('invoices')
+    .insert([{
+      invoice_id: invoiceData.invoiceId,
+      user_id: invoiceData.userId,
+      session_id: invoiceData.sessionId,
+      booking_id: invoiceData.bookingId,
+      filename: invoiceData.filename,
+      file_path: invoiceData.filePath,
+      file_size: invoiceData.fileSize,
+      document_type: invoiceData.documentType || 'invoice',
+      extracted_data: invoiceData.extractedData || {},
+      uploaded_at: new Date().toISOString(),
+      processed: false
+    }])
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+async function getSessionInvoices(sessionId) {
+  const { data, error } = await supabase
+    .from('invoices')
+    .select('*')
+    .eq('session_id', sessionId)
+    .order('uploaded_at', { ascending: false });
+  if (error) throw error;
+  return data || [];
+}
+
 async function getShipmentTracking(trackingNumber, userId = null) {
   let query = supabase
     .from('shipment_tracking')
@@ -262,16 +306,23 @@ app.get('/', async (req, res) => {
       .from('shipment_tracking')
       .select('*', { count: 'exact', head: true });
 
+    const { count: invoiceCount } = await supabase
+      .from('invoices')
+      .select('*', { count: 'exact', head: true });
+
     return res.json({ 
       status: 'FreightChat Pro API - Pure Agent Architecture',
       registeredUsers: userCount || 0,
       totalDocuments: docCount || 0,
       activeShipments: trackingCount || 0,
+      invoicesProcessed: invoiceCount || 0,
       database: 'Supabase Connected',
+      redis: 'Upstash Connected',
       agentStatus: shippingAgent ? '✓ Active' : '⚠ Initializing',
       architecture: 'LangGraph Multi-Agent',
-      features: ['PDF Chat', 'AI Shipping Agent', 'Real-time Tracking'],
-      version: '5.0.0-pure-agent'
+      deployment: 'Render Free Tier Ready',
+      features: ['PDF Chat', 'AI Shipping Agent', 'Real-time Tracking', 'Invoice Processing'],
+      version: '5.2.0-free-deployment'
     });
   } catch (error) {
     return res.status(500).json({
@@ -420,6 +471,110 @@ app.post('/upload/pdf', verifyUserToken, upload.single('pdf'), async (req, res) 
   }
 });
 
+// Invoice upload during agent conversation
+app.post('/agent/shipping/upload-invoice', verifyUserToken, upload.single('invoice'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No invoice file uploaded' });
+    }
+
+    const { threadId, bookingId } = req.body;
+    
+    if (!threadId) {
+      return res.status(400).json({ error: 'threadId is required' });
+    }
+
+    const userId = req.userId;
+    const invoiceId = crypto.randomBytes(16).toString('hex');
+    const fileSize = req.file.size;
+
+    const invoiceRecord = await createInvoiceRecord({
+      invoiceId,
+      userId,
+      sessionId: threadId,
+      bookingId: bookingId || null,
+      filename: req.file.originalname,
+      filePath: req.file.path,
+      fileSize
+    });
+
+    await invoiceQueue.add('process-invoice', {
+      invoiceId,
+      filename: req.file.originalname,
+      path: req.file.path,
+      userId,
+      sessionId: threadId,
+      bookingId: bookingId || null,
+      uploadedAt: new Date().toISOString()
+    });
+
+    if (shippingAgent) {
+      const config = { configurable: { thread_id: threadId } };
+      const snapshot = await checkpointer.get(config);
+      
+      if (snapshot) {
+        const currentState = snapshot.channel_values;
+        
+        if (!currentState.shipmentData.invoices) {
+          currentState.shipmentData.invoices = [];
+        }
+        
+        currentState.shipmentData.invoices.push({
+          invoiceId,
+          filename: req.file.originalname,
+          uploadedAt: new Date().toISOString(),
+          processed: false
+        });
+
+        currentState.messages.push({
+          role: 'system',
+          content: `Invoice uploaded: ${req.file.originalname}`,
+          timestamp: new Date().toISOString()
+        });
+      }
+    }
+
+    return res.json({
+      success: true,
+      message: 'Invoice uploaded successfully and queued for processing',
+      invoiceId,
+      filename: req.file.originalname,
+      fileSize,
+      sessionId: threadId,
+      processing: 'AI analysis in progress'
+    });
+
+  } catch (error) {
+    console.error('Error uploading invoice:', error);
+    return res.status(500).json({ error: 'Failed to upload invoice' });
+  }
+});
+
+// Get invoices for a session
+app.get('/agent/shipping/invoices/:threadId', verifyUserToken, async (req, res) => {
+  try {
+    const { threadId } = req.params;
+    const invoices = await getSessionInvoices(threadId);
+    
+    return res.json({
+      success: true,
+      threadId,
+      invoices: invoices.map(inv => ({
+        invoiceId: inv.invoice_id,
+        filename: inv.filename,
+        uploadedAt: inv.uploaded_at,
+        processed: inv.processed,
+        extractedData: inv.extracted_data,
+        documentType: inv.document_type
+      })),
+      count: invoices.length
+    });
+  } catch (error) {
+    console.error('Error fetching invoices:', error);
+    return res.status(500).json({ error: 'Failed to fetch invoices' });
+  }
+});
+
 // Document chat endpoint
 app.get('/chat/documents', verifyUserToken, async (req, res) => {
   try {
@@ -547,7 +702,11 @@ app.post('/agent/shipping/start', verifyUserToken, async (req, res) => {
       message: result.output || "Welcome! I'm your AI shipping agent. Let's get started with your shipment. Where are you shipping from and to?",
       currentPhase: result.currentPhase,
       completed: result.completed,
-      architecture: 'LangGraph Agent'
+      architecture: 'LangGraph Agent',
+      features: {
+        invoiceUpload: true,
+        uploadEndpoint: '/agent/shipping/upload-invoice'
+      }
     });
 
   } catch (error) {
@@ -592,7 +751,6 @@ app.post('/agent/shipping/message', verifyUserToken, async (req, res) => {
 
     const result = await shippingAgent.invoke(currentState, config);
 
-    // Save quote if completed
     if (result.completed && result.quote) {
       try {
         await saveShippingQuote(threadId, result.quote, req.userId);
@@ -609,7 +767,8 @@ app.post('/agent/shipping/message', verifyUserToken, async (req, res) => {
       shipmentData: result.shipmentData,
       quote: result.quote,
       completed: result.completed,
-      nextAction: result.nextAction
+      nextAction: result.nextAction,
+      invoices: result.shipmentData.invoices || []
     });
 
   } catch (error) {
@@ -657,13 +816,24 @@ app.post('/agent/shipping/book', verifyUserToken, async (req, res) => {
       estimatedDelivery: estimatedDelivery.toISOString()
     });
 
+    // Link invoices to booking
+    if (state.shipmentData?.invoices?.length > 0) {
+      for (const invoice of state.shipmentData.invoices) {
+        await supabase
+          .from('invoices')
+          .update({ booking_id: bookingId })
+          .eq('invoice_id', invoice.invoiceId);
+      }
+    }
+
     return res.json({
       success: true,
       message: 'Shipment booked successfully!',
       bookingId,
       trackingNumber,
       carrierId,
-      estimatedDelivery: estimatedDelivery.toISOString()
+      estimatedDelivery: estimatedDelivery.toISOString(),
+      linkedInvoices: state.shipmentData?.invoices?.length || 0
     });
 
   } catch (error) {
@@ -726,7 +896,10 @@ app.listen(PORT, () => {
   console.log(`✓ FreightChat Pro API Running`);
   console.log(`📍 Port: ${PORT}`);
   console.log(`🌐 Health: http://localhost:${PORT}/`);
-  console.log(`📦 Version: 5.0.0 - Pure Agent Architecture`);
+  console.log(`📦 Version: 5.2.0 - Free Deployment Ready`);
   console.log(`🤖 Agent Status: ${shippingAgent ? '✓ Ready' : '⚠ Initializing...'}`);
+  console.log(`📄 Invoice Processing: ✓ Active`);
+  console.log(`☁️  Redis: Upstash Connected`);
+  console.log(`🚀 Deployment: Render Free Tier`);
   console.log('========================================');
 });

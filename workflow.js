@@ -26,7 +26,7 @@ async function shippingAgentNode(state) {
   if (state.messages.length === 0) {
     const greetingMessage = {
       role: 'assistant',
-      content: "Hello! I'm your AI shipping agent. I'll help you get the best freight quotes. To start, could you tell me where you're shipping from and to? (Example: From Mumbai, India to New York, USA)",
+      content: "Hello! I'm your AI shipping agent. I'll help you get the best freight quotes and manage your shipment.\n\nTo start, could you tell me:\n1. Where are you shipping from?\n2. Where are you shipping to?\n\n(Example: From Mumbai, India to New York, USA)\n\nYou can also upload invoices or shipping documents at any time during our conversation.",
       timestamp: new Date().toISOString()
     };
     
@@ -51,31 +51,60 @@ async function shippingAgentNode(state) {
     };
   }
 
+  // Check for system messages about invoice uploads
+  const systemMessages = state.messages.filter(m => m.role === 'system');
+  const hasNewInvoice = systemMessages.length > 0 && 
+    systemMessages[systemMessages.length - 1].content.includes('Invoice uploaded');
+
   // User has sent a message - process it
   const userMessage = lastMessage.content;
   
-  // Build conversation context
-  const conversationHistory = state.messages.slice(-6).map(m => 
-    m.role === 'user' ? new HumanMessage(m.content) : new AIMessage(m.content)
-  );
+  // Build conversation context (last 10 messages for better context)
+  const conversationHistory = state.messages.slice(-10).map(m => {
+    if (m.role === 'user') return new HumanMessage(m.content);
+    if (m.role === 'assistant') return new AIMessage(m.content);
+    if (m.role === 'system') return new SystemMessage(m.content);
+    return new HumanMessage(m.content);
+  });
+
+  // Build context about uploaded invoices
+  const invoiceContext = state.shipmentData.invoices && state.shipmentData.invoices.length > 0
+    ? `\n\nUPLOADED INVOICES:\n${state.shipmentData.invoices.map(inv => 
+        `- ${inv.filename} (${inv.processed ? 'Processed' : 'Processing...'})`
+      ).join('\n')}`
+    : '';
 
   // System prompt for the agent
   const systemPrompt = `You are a professional freight shipping assistant helping users book shipments.
 
 Current Phase: ${state.currentPhase}
-Collected Data: ${JSON.stringify(state.shipmentData, null, 2)}
+Collected Data: ${JSON.stringify(state.shipmentData, null, 2)}${invoiceContext}
 
-Your task:
-1. Extract information from user messages (origin, destination, cargo details, weight, service level, etc.)
-2. Guide them through collecting: route, cargo details, service preference, special requirements, declared value, contact info
-3. Once you have enough info (at minimum: origin, destination, cargo, weight), generate a quote
+CRITICAL INSTRUCTIONS:
+1. Extract shipping information from user messages and update the shipmentData
+2. Guide users through collecting these details (one at a time):
+   - Origin location (city, country)
+   - Destination location (city, country)
+   - Cargo description
+   - Weight (in kg)
+   - Service level preference (Express/Standard/Economy)
+   - Special requirements (optional)
+   - Declared value (optional)
+   - Contact information (optional)
 
-Respond naturally and conversationally. Ask for ONE piece of information at a time.
+3. When user uploads an invoice, acknowledge it warmly and explain you'll use it to auto-fill details
 
-If you have collected: origin, destination, cargo (with approximate weight), then respond with:
-GENERATE_QUOTE: {extracted data as JSON}
+4. GENERATE QUOTE when you have AT MINIMUM:
+   - Origin
+   - Destination
+   - Cargo description
+   - Weight (approximate is fine)
 
-Otherwise, continue the conversation by asking for the next piece of information.`;
+5. Response format:
+   - For normal conversation: Just respond naturally
+   - When ready for quote: Start your response with "READY_FOR_QUOTE" on first line, then provide natural response
+
+Be conversational, friendly, and professional. Ask for ONE thing at a time. Don't overwhelm the user.`;
 
   try {
     const response = await model.invoke([
@@ -83,82 +112,104 @@ Otherwise, continue the conversation by asking for the next piece of information
       ...conversationHistory
     ]);
 
-    let assistantResponse = response.content;
-    let shouldGenerateQuote = false;
-    let extractedData = state.shipmentData;
+    // Handle response content safely
+    const responseText = typeof response.content === 'string' 
+      ? response.content 
+      : JSON.stringify(response.content);
 
-    // Check if agent wants to generate quote
-    if (assistantResponse.includes('GENERATE_QUOTE:')) {
-      shouldGenerateQuote = true;
-      const jsonMatch = assistantResponse.match(/GENERATE_QUOTE:\s*({[\s\S]*})/);
-      if (jsonMatch) {
-        try {
-          extractedData = { ...state.shipmentData, ...JSON.parse(jsonMatch[1]) };
-        } catch (e) {
-          console.log('Failed to parse quote data');
-        }
-      }
-    } else {
-      // Extract data from user message using AI
-      const extractionPrompt = `Extract shipping information from this message: "${userMessage}"
+    const shouldGenerateQuote = responseText.trim().startsWith('READY_FOR_QUOTE');
+    
+    // Remove the READY_FOR_QUOTE marker from display
+    const assistantResponse = shouldGenerateQuote 
+      ? responseText.replace(/^READY_FOR_QUOTE\s*/i, '').trim()
+      : responseText;
+
+    // Extract data from conversation using structured extraction
+    let extractedData = { ...state.shipmentData };
+    
+    // Use AI to extract structured data
+    const extractionPrompt = `Extract shipping information from this user message and conversation context.
+
+User message: "${userMessage}"
 
 Current data: ${JSON.stringify(state.shipmentData, null, 2)}
 
-Return JSON with any found fields:
+Return ONLY valid JSON with any found/updated fields (use null for missing fields):
 {
-  "origin": "city, country",
-  "destination": "city, country", 
-  "cargo": "description",
-  "weight": "number with unit",
-  "serviceLevel": "Express|Standard|Economy",
-  "specialRequirements": "description",
-  "declaredValue": "amount",
-  "contactName": "name",
-  "contactEmail": "email",
-  "contactPhone": "phone"
-}
+  "origin": "city, country or null",
+  "destination": "city, country or null", 
+  "cargo": "description or null",
+  "weight": "number with unit (e.g., '50kg') or null",
+  "serviceLevel": "Express|Standard|Economy or null",
+  "specialRequirements": "description or null",
+  "declaredValue": "amount or null",
+  "contactName": "name or null",
+  "contactEmail": "email or null",
+  "contactPhone": "phone or null"
+}`;
 
-Only include fields with information. Return valid JSON only.`;
+    try {
+      const extractResponse = await model.invoke([
+        new SystemMessage(extractionPrompt),
+        new HumanMessage(userMessage)
+      ]);
 
-      try {
-        const extractResponse = await model.invoke([
-          new SystemMessage(extractionPrompt),
-          new HumanMessage(userMessage)
-        ]);
+      const extractedText = typeof extractResponse.content === 'string'
+        ? extractResponse.content
+        : JSON.stringify(extractResponse.content);
 
-        const extracted = JSON.parse(extractResponse.content);
-        extractedData = { ...state.shipmentData, ...extracted };
-      } catch (e) {
-        // Extraction failed, keep existing data
+      // Try to parse JSON from response
+      const jsonMatch = extractedText.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const parsed = JSON.parse(jsonMatch[0]);
+        // Only update fields that have non-null values
+        Object.keys(parsed).forEach(key => {
+          if (parsed[key] !== null && parsed[key] !== '') {
+            extractedData[key] = parsed[key];
+          }
+        });
       }
+    } catch (e) {
+      console.log('Data extraction failed, keeping existing data:', e.message);
     }
 
     // Generate quote if ready
-    if (shouldGenerateQuote) {
+    if (shouldGenerateQuote && extractedData.origin && extractedData.destination && extractedData.cargo) {
       const quote = await generateShippingQuote(extractedData);
       
-      const quoteMessage = `Great! I've found the best shipping options for you:
+      const quoteMessage = `${assistantResponse}
 
-**Top 3 Carriers:**
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SHIPPING QUOTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-1. **${quote.quotes[0].name}** - $${quote.quotes[0].rate}
-   - Transit: ${quote.quotes[0].transitTime}
-   - Reliability: ${quote.quotes[0].reliability}
+**Top 3 Recommended Carriers:**
 
-2. **${quote.quotes[1].name}** - $${quote.quotes[1].rate}
-   - Transit: ${quote.quotes[1].transitTime}
-   - Reliability: ${quote.quotes[1].reliability}
+1. **${quote.quotes[0].name}**
+   Rate: $${quote.quotes[0].rate}
+   Transit: ${quote.quotes[0].transitTime}
+   Reliability: ${quote.quotes[0].reliability}
 
-3. **${quote.quotes[2].name}** - $${quote.quotes[2].rate}
-   - Transit: ${quote.quotes[2].transitTime}
-   - Reliability: ${quote.quotes[2].reliability}
+2. **${quote.quotes[1].name}**
+   Rate: $${quote.quotes[1].rate}
+   Transit: ${quote.quotes[1].transitTime}
+   Reliability: ${quote.quotes[1].reliability}
 
-📦 **Shipment Details:**
-- Route: ${extractedData.origin || 'Origin'} → ${extractedData.destination || 'Destination'}
-- Weight: ${extractedData.weight || 'N/A'}
-- Service: ${extractedData.serviceLevel || 'Standard'}
+3. **${quote.quotes[2].name}**
+   Rate: $${quote.quotes[2].rate}
+   Transit: ${quote.quotes[2].transitTime}
+   Reliability: ${quote.quotes[2].reliability}
 
-Would you like to book one of these options?`;
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Shipment Summary:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Route: ${extractedData.origin || 'Origin'} → ${extractedData.destination || 'Destination'}
+Weight: ${extractedData.weight || 'Not specified'}
+Service: ${extractedData.serviceLevel || 'Standard'}
+${extractedData.specialRequirements ? `Special: ${extractedData.specialRequirements}` : ''}
+${state.shipmentData.invoices?.length > 0 ? `Invoices: ${state.shipmentData.invoices.length} uploaded` : ''}
+
+Would you like to book one of these carriers?`;
 
       state.messages.push({
         role: 'assistant',
@@ -193,7 +244,7 @@ Would you like to book one of these options?`;
 
   } catch (error) {
     console.error('Agent error:', error);
-    const errorMessage = "I apologize, I encountered an error. Could you please repeat that?";
+    const errorMessage = "I apologize, I encountered an error processing your request. Could you please try rephrasing that?";
     
     state.messages.push({
       role: 'assistant',
@@ -211,9 +262,10 @@ Would you like to book one of these options?`;
 
 function determinePhase(data) {
   if (data.quote) return 'quote_generated';
-  if (data.origin && data.destination && data.cargo) return 'finalizing';
-  if (data.cargo) return 'service_selection';
-  if (data.origin || data.destination) return 'cargo_collection';
+  if (data.origin && data.destination && data.cargo && data.weight) return 'ready_for_quote';
+  if (data.cargo && data.weight) return 'service_selection';
+  if (data.origin && data.destination) return 'cargo_collection';
+  if (data.origin || data.destination) return 'route_collection';
   return 'route_collection';
 }
 
@@ -251,26 +303,30 @@ export class ShippingAgentExecutor {
 }
 
 async function generateShippingQuote(shipmentData) {
-  const { cargo, serviceLevel, specialRequirements, declaredValue, origin, destination } = shipmentData;
+  const { cargo, weight, serviceLevel, specialRequirements, declaredValue, origin, destination } = shipmentData;
   
-  const weightMatch = cargo?.match(/(\d+)\s*kg/i);
-  const weight = weightMatch ? parseInt(weightMatch[1]) : 50;
+  // Extract weight value
+  const weightMatch = (weight || cargo || '').match(/(\d+)\s*kg/i);
+  const weightValue = weightMatch ? parseInt(weightMatch[1]) : 50;
   
-  const valueMatch = declaredValue?.match(/[\d,]+/);
+  // Extract declared value
+  const valueMatch = (declaredValue || '').match(/[\d,]+/);
   const value = valueMatch ? parseInt(valueMatch[0].replace(/,/g, '')) : 1000;
   
   const routeType = determineRouteType(origin, destination);
-  const baseRate = calculateBaseRate(routeType, weight, value);
+  const baseRate = calculateBaseRate(routeType, weightValue, value);
   const service = getServiceMultiplier(serviceLevel);
   const additionalCost = calculateAdditionalCosts(specialRequirements, value);
   
   const carriers = [
     { carrierId: 'dhl_express_001', name: 'DHL Express Worldwide', reputation: 9.4, reliability: 98.7 },
     { carrierId: 'fedex_intl_002', name: 'FedEx International Premium', reputation: 9.2, reliability: 98.2 },
-    { carrierId: 'ups_worldwide_003', name: 'UPS Worldwide Express', reputation: 9.0, reliability: 97.8 }
+    { carrierId: 'ups_worldwide_003', name: 'UPS Worldwide Express', reputation: 9.0, reliability: 97.8 },
+    { carrierId: 'maersk_004', name: 'Maersk Line Freight', reputation: 8.9, reliability: 97.5 },
+    { carrierId: 'db_schenker_005', name: 'DB Schenker Global', reputation: 8.8, reliability: 97.2 }
   ];
   
-  const quotes = carriers.map((carrier, index) => {
+  const quotes = carriers.slice(0, 3).map((carrier, index) => {
     const variation = 0.88 + (index * 0.08);
     const finalRate = (baseRate * service.multiplier * variation + additionalCost);
     const baseDays = service.days.split('-').map(d => parseInt(d));
@@ -282,7 +338,7 @@ async function generateShippingQuote(shipmentData) {
       name: carrier.name,
       service: serviceLevel || 'Standard',
       rate: finalRate.toFixed(2),
-      transitTime: `${minDays}-${maxDays} days`,
+      transitTime: `${minDays}-${maxDays} business days`,
       reputation: carrier.reputation,
       reliability: carrier.reliability + '%',
       estimatedDelivery: new Date(Date.now() + (minDays + 1) * 24 * 60 * 60 * 1000).toISOString(),
@@ -299,25 +355,45 @@ async function generateShippingQuote(shipmentData) {
     currency: 'USD',
     validUntil: new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString(),
     shipmentDetails: {
-      weight: weight + 'kg',
+      weight: weightValue + 'kg',
       declaredValue: '$' + value.toLocaleString(),
       route: `${origin || 'Origin'} → ${destination || 'Destination'}`,
-      serviceLevel: serviceLevel || 'Standard'
+      serviceLevel: serviceLevel || 'Standard',
+      cargo: cargo || 'General cargo'
     }
   };
 }
 
 function determineRouteType(origin, destination) {
   if (!origin || !destination) return 'domestic';
-  const international = ['usa', 'europe', 'china', 'japan', 'uk', 'canada'];
-  const isInternational = international.some(c => 
-    origin.toLowerCase().includes(c) || destination.toLowerCase().includes(c)
-  );
-  return isInternational ? 'international' : 'domestic';
+  
+  const originLower = origin.toLowerCase();
+  const destLower = destination.toLowerCase();
+  
+  const countries = ['usa', 'us', 'united states', 'uk', 'united kingdom', 'india', 'china', 
+                     'japan', 'germany', 'france', 'canada', 'australia', 'brazil', 'mexico'];
+  
+  const originCountry = countries.find(c => originLower.includes(c));
+  const destCountry = countries.find(c => destLower.includes(c));
+  
+  if (originCountry && destCountry && originCountry !== destCountry) {
+    return 'international';
+  }
+  
+  if (originLower.includes('asia') || destLower.includes('asia') ||
+      originLower.includes('europe') || destLower.includes('europe')) {
+    return 'international';
+  }
+  
+  return 'domestic';
 }
 
 function calculateBaseRate(routeType, weight, value) {
-  const routes = { domestic: 120, regional: 280, international: 480 };
+  const routes = { 
+    domestic: 120, 
+    regional: 280, 
+    international: 480 
+  };
   const baseRate = routes[routeType] || routes.domestic;
   const weightRate = Math.ceil(weight / 10) * 18;
   const valueRate = Math.ceil(value / 1000) * 5;
@@ -336,11 +412,16 @@ function getServiceMultiplier(serviceLevel) {
 function calculateAdditionalCosts(requirements, value) {
   if (!requirements) return 0;
   let cost = 0;
-  const reqString = Array.isArray(requirements) ? requirements.join(' ').toLowerCase() : requirements.toLowerCase();
+  const reqString = Array.isArray(requirements) 
+    ? requirements.join(' ').toLowerCase() 
+    : String(requirements).toLowerCase();
+  
   if (reqString.includes('insurance')) cost += Math.max(60, value * 0.008);
-  if (reqString.includes('fragile')) cost += 35;
-  if (reqString.includes('hazardous')) cost += 150;
-  if (reqString.includes('temperature')) cost += 95;
-  if (reqString.includes('customs')) cost += 55;
+  if (reqString.includes('fragile') || reqString.includes('handle with care')) cost += 35;
+  if (reqString.includes('hazardous') || reqString.includes('dangerous')) cost += 150;
+  if (reqString.includes('temperature') || reqString.includes('refrigerated')) cost += 95;
+  if (reqString.includes('customs') || reqString.includes('clearance')) cost += 55;
+  if (reqString.includes('express') || reqString.includes('urgent')) cost += 75;
+  
   return cost;
 }
