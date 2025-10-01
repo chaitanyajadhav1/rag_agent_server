@@ -652,11 +652,11 @@ invoiceWorker.on('failed', (job, err) => {
 
 // ========== HEALTH MONITORING ==========
 
-setInterval(() => {
-  const pdfStatus = pdfWorker.isRunning() ? '✓ Running' : '✗ Stopped';
-  const invoiceStatus = invoiceWorker.isRunning() ? '✓ Running' : '✗ Stopped';
-  console.log(`[Workers] PDF: ${pdfStatus} | Invoice: ${invoiceStatus}`);
-}, 60000);
+// setInterval(() => {
+//   const pdfStatus = pdfWorker.isRunning() ? '✓ Running' : '✗ Stopped';
+//   const invoiceStatus = invoiceWorker.isRunning() ? '✓ Running' : '✗ Stopped';
+//   console.log(`[Workers] PDF: ${pdfStatus} | Invoice: ${invoiceStatus}`);
+// }, 300000);
 
 // ========== HEALTH CHECK API WITH CORS ==========
 

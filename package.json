@@ -5,9 +5,9 @@
   "description": "PDF RAG system with vector embeddings",
   "main": "index.js",
   "scripts": {
-    "start": "concurrently \"node index.js\" \"node worker.js\"",
+    "start": "node index.js",
     "worker": "node worker.js",
-    "dev": "nodemon index.js",
+    "dev": "sh start.sh",
     "dev:worker": "nodemon worker.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
