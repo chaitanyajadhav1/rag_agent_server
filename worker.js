@@ -11,7 +11,6 @@ import fs from 'fs';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import { redisConnection } from './redis-config.js';
-import { Redis } from '@upstash/redis';
 
 dotenv.config();
 
@@ -23,12 +22,6 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_ANON_KEY
 );
-
-// Initialize Redis client for data storage
-const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN,
-});
 
 // ========== AI-POWERED DOCUMENT ANALYSIS ==========
 
@@ -310,7 +303,7 @@ const pdfWorker = new Worker(
             sentiment: aiAnalysis.sentiment,
             entities: aiAnalysis.keyEntities,
             fileSize,
-            processingVersion: '5.2.0-free'
+            processingVersion: '5.3.0-supabase-only'
           },
         });
       });
@@ -372,40 +365,34 @@ const pdfWorker = new Worker(
         }
       }
 
-      // ========== SAVE TO REDIS ==========
+      // ========== UPDATE SUPABASE DOCUMENT RECORD ==========
       try {
-        const redisKey = `document:${documentId}`;
-        const redisData = {
-          documentId,
-          userId,
-          filename,
-          collectionName,
-          strategy,
-          fileSize,
-          totalPages: docs.length,
-          totalChunks: processedChunks,
-          aiAnalysis,
-          processedAt: new Date().toISOString(),
-          version: '5.2.0-free'
-        };
-
-        await redis.set(redisKey, JSON.stringify(redisData));
-        
-        // Also add to user's document list
-        await redis.sadd(`user:${userId}:documents`, documentId);
-        
-        // Store document metadata for quick listing
-        await redis.hset(`user:${userId}:doc_metadata`, {
-          [documentId]: JSON.stringify({
-            filename,
-            documentType: aiAnalysis.documentType,
-            processedAt: new Date().toISOString()
+        const { error: updateError } = await supabase
+          .from('documents')
+          .update({
+            total_pages: docs.length,
+            total_chunks: processedChunks,
+            file_size: fileSize,
+            document_type: aiAnalysis.documentType,
+            language: aiAnalysis.language,
+            confidence: aiAnalysis.confidence,
+            summary: aiAnalysis.summary,
+            topics: aiAnalysis.topics,
+            sentiment: aiAnalysis.sentiment,
+            key_entities: aiAnalysis.keyEntities,
+            processed: true,
+            processed_at: new Date().toISOString(),
+            processing_version: '5.3.0-supabase-only'
           })
-        });
+          .eq('document_id', documentId);
 
-        console.log(`[PDF Worker] ✓ Saved to Redis: ${redisKey}`);
-      } catch (redisError) {
-        console.warn(`[PDF Worker] Redis save failed:`, redisError.message);
+        if (updateError) {
+          console.warn(`[PDF Worker] Supabase update failed:`, updateError.message);
+        } else {
+          console.log(`[PDF Worker] ✓ Updated Supabase record: ${documentId}`);
+        }
+      } catch (supabaseError) {
+        console.warn(`[PDF Worker] Supabase update error:`, supabaseError.message);
       }
 
       try {
@@ -426,7 +413,7 @@ const pdfWorker = new Worker(
         strategy,
         aiAnalysis,
         processingTime,
-        version: '5.2.0-free'
+        version: '5.3.0-supabase-only'
       };
 
     } catch (err) {
@@ -511,13 +498,14 @@ const invoiceWorker = new Worker(
       console.log(`[Invoice Worker] Ready for Booking: ${analysis.validation.readyForBooking}`);
       console.log(`[Invoice Worker] ======================================\n`);
 
-      console.log(`[Invoice Worker] Updating database...`);
+      console.log(`[Invoice Worker] Updating Supabase...`);
       const { data: updateData, error: updateError } = await supabase
         .from('invoices')
         .update({
           processed: true,
           document_type: analysis.documentType,
           extracted_data: analysis,
+          total_pages: docs.length,
           processed_at: new Date().toISOString()
         })
         .eq('invoice_id', invoiceId)
@@ -528,59 +516,7 @@ const invoiceWorker = new Worker(
         throw updateError;
       }
       
-      console.log(`[Invoice Worker] ✓ Database updated successfully`);
-
-      // ========== SAVE TO REDIS ==========
-      try {
-        const redisKey = `invoice:${invoiceId}`;
-        const redisData = {
-          invoiceId,
-          userId,
-          sessionId,
-          bookingId,
-          filename,
-          fileSize,
-          totalPages: docs.length,
-          analysis,
-          processedAt: new Date().toISOString(),
-          version: '5.2.0-free'
-        };
-
-        await redis.set(redisKey, JSON.stringify(redisData));
-        
-        // Add to user's invoice list
-        await redis.sadd(`user:${userId}:invoices`, invoiceId);
-        
-        // Add to session's invoice list if sessionId exists
-        if (sessionId) {
-          await redis.sadd(`session:${sessionId}:invoices`, invoiceId);
-        }
-        
-        // Add to booking's invoice list if bookingId exists
-        if (bookingId) {
-          await redis.sadd(`booking:${bookingId}:invoices`, invoiceId);
-        }
-        
-        // Store invoice metadata for quick listing
-        await redis.hset(`user:${userId}:invoice_metadata`, {
-          [invoiceId]: JSON.stringify({
-            filename,
-            documentType: analysis.documentType,
-            invoiceNumber: analysis.invoiceDetails?.invoiceNumber,
-            totalAmount: analysis.financials?.totalAmount,
-            currency: analysis.financials?.currency,
-            processedAt: new Date().toISOString(),
-            readyForBooking: analysis.validation?.readyForBooking
-          })
-        });
-
-        // Store latest invoice for quick access
-        await redis.set(`user:${userId}:latest_invoice`, invoiceId);
-
-        console.log(`[Invoice Worker] ✓ Saved to Redis: ${redisKey}`);
-      } catch (redisError) {
-        console.warn(`[Invoice Worker] Redis save failed:`, redisError.message);
-      }
+      console.log(`[Invoice Worker] ✓ Supabase updated successfully`);
 
       try {
         console.log(`[Invoice Worker] Creating vector embeddings...`);
@@ -604,7 +540,7 @@ const invoiceWorker = new Worker(
             analysis: analysis,
             processedAt: new Date().toISOString(),
             fileSize,
-            version: '5.2.0-free'
+            version: '5.3.0-supabase-only'
           },
         });
 
@@ -620,7 +556,7 @@ const invoiceWorker = new Worker(
         );
 
         await vectorStore.addDocuments([invoiceDoc]);
-        console.log(`[Invoice Worker] ✓ Vector embeddings created`);
+        console.log(`[Invoice Worker] ✓ Vector embeddings created in Qdrant`);
       } catch (vectorError) {
         console.warn(`[Invoice Worker] Vector storage failed:`, vectorError.message);
       }
@@ -644,7 +580,7 @@ const invoiceWorker = new Worker(
         analysis,
         collectionName: `invoices_${userId}`,
         processingTime,
-        version: '5.2.0-free'
+        version: '5.3.0-supabase-only'
       };
 
     } catch (err) {
@@ -727,7 +663,6 @@ setInterval(() => {
 const workerApp = express();
 const WORKER_PORT = process.env.WORKER_PORT || 8001;
 
-// ========== CRITICAL: ADD CORS MIDDLEWARE ==========
 workerApp.use(cors({
   origin: ['http://localhost:3000', 'http://localhost:3001'],
   credentials: true,
@@ -735,7 +670,6 @@ workerApp.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-// Add JSON body parser
 workerApp.use(express.json());
 
 workerApp.get('/health', (req, res) => {
@@ -755,26 +689,30 @@ workerApp.get('/health', (req, res) => {
         concurrency: 1
       }
     ],
-    redis: 'Upstash Connected',
+    storage: 'Supabase (Qdrant for vectors)',
+    cache: 'None (direct Supabase queries)',
     deployment: 'Render Free Tier',
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
-    version: '5.2.0-free'
+    version: '5.3.0-supabase-only'
   });
 });
 
-// ========== REDIS DATA RETRIEVAL ENDPOINTS ==========
+// ========== SUPABASE DATA RETRIEVAL ENDPOINTS ==========
 
 workerApp.get('/api/invoice/:invoiceId', async (req, res) => {
   try {
     const { invoiceId } = req.params;
-    const data = await redis.get(`invoice:${invoiceId}`);
+    const { data, error } = await supabase
+      .from('invoices')
+      .select('*')
+      .eq('invoice_id', invoiceId)
+      .single();
     
-    if (!data) {
-      return res.status(404).json({ error: 'Invoice not found in Redis' });
-    }
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Invoice not found' });
     
-    res.json(JSON.parse(data));
+    res.json(data);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -783,13 +721,16 @@ workerApp.get('/api/invoice/:invoiceId', async (req, res) => {
 workerApp.get('/api/document/:documentId', async (req, res) => {
   try {
     const { documentId } = req.params;
-    const data = await redis.get(`document:${documentId}`);
+    const { data, error } = await supabase
+      .from('documents')
+      .select('*')
+      .eq('document_id', documentId)
+      .single();
     
-    if (!data) {
-      return res.status(404).json({ error: 'Document not found in Redis' });
-    }
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Document not found' });
     
-    res.json(JSON.parse(data));
+    res.json(data);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -798,15 +739,19 @@ workerApp.get('/api/document/:documentId', async (req, res) => {
 workerApp.get('/api/user/:userId/invoices', async (req, res) => {
   try {
     const { userId } = req.params;
-    const invoiceIds = await redis.smembers(`user:${userId}:invoices`);
-    const metadata = await redis.hgetall(`user:${userId}:invoice_metadata`);
+    const { data, error } = await supabase
+      .from('invoices')
+      .select('invoice_id, filename, document_type, uploaded_at, processed, extracted_data')
+      .eq('user_id', userId)
+      .order('uploaded_at', { ascending: false });
     
-    const invoices = invoiceIds.map(id => ({
-      invoiceId: id,
-      ...JSON.parse(metadata[id] || '{}')
-    }));
+    if (error) throw error;
     
-    res.json({ userId, invoices });
+    res.json({ 
+      userId, 
+      invoices: data || [],
+      count: data?.length || 0
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -815,15 +760,19 @@ workerApp.get('/api/user/:userId/invoices', async (req, res) => {
 workerApp.get('/api/user/:userId/documents', async (req, res) => {
   try {
     const { userId } = req.params;
-    const documentIds = await redis.smembers(`user:${userId}:documents`);
-    const metadata = await redis.hgetall(`user:${userId}:doc_metadata`);
+    const { data, error } = await supabase
+      .from('documents')
+      .select('document_id, filename, document_type, uploaded_at, processed, total_pages, total_chunks')
+      .eq('user_id', userId)
+      .order('uploaded_at', { ascending: false });
     
-    const documents = documentIds.map(id => ({
-      documentId: id,
-      ...JSON.parse(metadata[id] || '{}')
-    }));
+    if (error) throw error;
     
-    res.json({ userId, documents });
+    res.json({ 
+      userId, 
+      documents: data || [],
+      count: data?.length || 0
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -833,9 +782,11 @@ workerApp.listen(WORKER_PORT, () => {
   console.log('========================================');
   console.log('FreightChat Pro Workers Started');
   console.log('========================================');
-  console.log(`Version: 5.2.0-free-deployment`);
+  console.log(`Version: 5.3.0-supabase-only`);
   console.log(`Health Check: http://localhost:${WORKER_PORT}/health`);
-  console.log(`Redis: Upstash Connected (with data storage)`);
+  console.log(`Storage: Supabase (single source of truth)`);
+  console.log(`Vectors: Qdrant`);
+  console.log(`Queue: BullMQ (Redis for jobs only)`);
   console.log(`Deployment: Render Free Tier Ready`);
   console.log(`CORS: Enabled for localhost:3000, localhost:3001`);
   console.log('========================================');
