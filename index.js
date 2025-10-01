@@ -12,6 +12,8 @@ import { createClient } from '@supabase/supabase-js';
 import { MemorySaver } from '@langchain/langgraph';
 import { createShippingAgent, ShippingAgentExecutor } from './workflow.js';
 import { redisConnection } from './redis-config.js';
+import cloudinary from './cloudinary-config.js';
+import { CloudinaryStorage } from 'multer-storage-cloudinary';
 
 dotenv.config();
 
@@ -53,22 +55,23 @@ const invoiceQueue = new Queue('invoice-upload-queue', {
 
 console.log('✓ BullMQ queues initialized with Upstash Redis');
 
-const uploadsDir = 'uploads';
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-  console.log('✓ Uploads directory created');
-}
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, 'uploads/'),
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-    cb(null, `${uniqueSuffix}-${file.originalname}`);
+// Cloudinary storage configuration
+const cloudinaryStorage = new CloudinaryStorage({
+  cloudinary: cloudinary,
+  params: {
+    folder: 'freightchat-documents',
+    resource_type: 'raw',
+    allowed_formats: ['pdf'],
+    public_id: (req, file) => {
+      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+      return `${uniqueSuffix}-${file.originalname.replace(/\.pdf$/i, '')}`;
+    },
   },
 });
 
+// Multer upload configuration with Cloudinary
 const upload = multer({ 
-  storage,
+  storage: cloudinaryStorage,
   fileFilter: (req, file, cb) => {
     if (file.mimetype === 'application/pdf') {
       cb(null, true);
@@ -76,7 +79,7 @@ const upload = multer({
       cb(new Error('Only PDF files allowed'), false);
     }
   },
-  limits: { fileSize: 10 * 1024 * 1024 }
+  limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
 });
 
 const app = express();
@@ -139,6 +142,8 @@ async function createDocument(docData) {
       filename: docData.filename,
       collection_name: docData.collectionName,
       strategy: docData.strategy,
+      cloudinary_url: docData.cloudinaryUrl,
+      cloudinary_public_id: docData.cloudinaryPublicId,
       uploaded_at: new Date().toISOString()
     }])
     .select()
@@ -204,7 +209,8 @@ async function createInvoiceRecord(invoiceData) {
       session_id: invoiceData.sessionId,
       booking_id: invoiceData.bookingId,
       filename: invoiceData.filename,
-      file_path: invoiceData.filePath,
+      cloudinary_url: invoiceData.cloudinaryUrl,
+      cloudinary_public_id: invoiceData.cloudinaryPublicId,
       file_size: invoiceData.fileSize,
       document_type: invoiceData.documentType || 'invoice',
       extracted_data: invoiceData.extractedData || {},
@@ -311,18 +317,19 @@ app.get('/', async (req, res) => {
       .select('*', { count: 'exact', head: true });
 
     return res.json({ 
-      status: 'FreightChat Pro API - Pure Agent Architecture',
+      status: 'FreightChat Pro API - Cloudinary Integration',
       registeredUsers: userCount || 0,
       totalDocuments: docCount || 0,
       activeShipments: trackingCount || 0,
       invoicesProcessed: invoiceCount || 0,
       database: 'Supabase Connected',
       redis: 'Upstash Connected',
+      storage: 'Cloudinary Active',
       agentStatus: shippingAgent ? '✓ Active' : '⚠ Initializing',
       architecture: 'LangGraph Multi-Agent',
       deployment: 'Render Free Tier Ready',
       features: ['PDF Chat', 'AI Shipping Agent', 'Real-time Tracking', 'Invoice Processing'],
-      version: '5.2.0-free-deployment'
+      version: '5.4.0-cloudinary'
     });
   } catch (error) {
     return res.status(500).json({
@@ -421,15 +428,21 @@ app.get('/auth/profile', verifyUserToken, async (req, res) => {
   }
 });
 
-// PDF upload
+// PDF upload with Cloudinary
 app.post('/upload/pdf', verifyUserToken, upload.single('pdf'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No PDF file uploaded' });
     }
+
     const userId = req.userId;
     const documentId = crypto.randomBytes(16).toString('hex');
     const strategy = req.body.strategy || 'user';
+    
+    // Cloudinary info from multer-storage-cloudinary
+    const cloudinaryUrl = req.file.path; // Full Cloudinary URL
+    const cloudinaryPublicId = req.file.filename; // Cloudinary public_id
+    
     let collectionName;
     switch (strategy) {
       case 'document':
@@ -443,11 +456,21 @@ app.post('/upload/pdf', verifyUserToken, upload.single('pdf'), async (req, res) 
         collectionName = `user_${userId}`;
         break;
     }
-    await createDocument({ documentId, userId, filename: req.file.originalname, collectionName, strategy });
+
+    await createDocument({ 
+      documentId, 
+      userId, 
+      filename: req.file.originalname, 
+      collectionName, 
+      strategy,
+      cloudinaryUrl,
+      cloudinaryPublicId
+    });
+
     await queue.add('file-ready', {
       filename: req.file.originalname,
-      destination: req.file.destination,
-      path: req.file.path,
+      cloudinaryUrl,
+      cloudinaryPublicId,
       userId,
       documentId,
       collectionName,
@@ -457,13 +480,15 @@ app.post('/upload/pdf', verifyUserToken, upload.single('pdf'), async (req, res) 
         uploadedAt: new Date().toISOString(),
       }
     });
+
     return res.json({ 
-      message: 'PDF uploaded and queued for processing',
+      message: 'PDF uploaded to Cloudinary and queued for processing',
       filename: req.file.originalname,
       documentId,
       userId,
       collectionName,
-      strategy
+      strategy,
+      cloudinaryUrl
     });
   } catch (error) {
     console.error('Error uploading PDF:', error);
@@ -471,7 +496,7 @@ app.post('/upload/pdf', verifyUserToken, upload.single('pdf'), async (req, res) 
   }
 });
 
-// Invoice upload during agent conversation
+// Invoice upload during agent conversation with Cloudinary
 app.post('/agent/shipping/upload-invoice', verifyUserToken, upload.single('invoice'), async (req, res) => {
   try {
     if (!req.file) {
@@ -486,6 +511,10 @@ app.post('/agent/shipping/upload-invoice', verifyUserToken, upload.single('invoi
 
     const userId = req.userId;
     const invoiceId = crypto.randomBytes(16).toString('hex');
+    
+    // Cloudinary info
+    const cloudinaryUrl = req.file.path;
+    const cloudinaryPublicId = req.file.filename;
     const fileSize = req.file.size;
 
     const invoiceRecord = await createInvoiceRecord({
@@ -494,14 +523,16 @@ app.post('/agent/shipping/upload-invoice', verifyUserToken, upload.single('invoi
       sessionId: threadId,
       bookingId: bookingId || null,
       filename: req.file.originalname,
-      filePath: req.file.path,
+      cloudinaryUrl,
+      cloudinaryPublicId,
       fileSize
     });
 
     await invoiceQueue.add('process-invoice', {
       invoiceId,
       filename: req.file.originalname,
-      path: req.file.path,
+      cloudinaryUrl,
+      cloudinaryPublicId,
       userId,
       sessionId: threadId,
       bookingId: bookingId || null,
@@ -536,11 +567,12 @@ app.post('/agent/shipping/upload-invoice', verifyUserToken, upload.single('invoi
 
     return res.json({
       success: true,
-      message: 'Invoice uploaded successfully and queued for processing',
+      message: 'Invoice uploaded to Cloudinary and queued for AI analysis',
       invoiceId,
       filename: req.file.originalname,
       fileSize,
       sessionId: threadId,
+      cloudinaryUrl,
       processing: 'AI analysis in progress'
     });
 
@@ -565,7 +597,8 @@ app.get('/agent/shipping/invoices/:threadId', verifyUserToken, async (req, res) 
         uploadedAt: inv.uploaded_at,
         processed: inv.processed,
         extractedData: inv.extracted_data,
-        documentType: inv.document_type
+        documentType: inv.document_type,
+        cloudinaryUrl: inv.cloudinary_url
       })),
       count: invoices.length
     });
@@ -705,7 +738,8 @@ app.post('/agent/shipping/start', verifyUserToken, async (req, res) => {
       architecture: 'LangGraph Agent',
       features: {
         invoiceUpload: true,
-        uploadEndpoint: '/agent/shipping/upload-invoice'
+        uploadEndpoint: '/agent/shipping/upload-invoice',
+        storage: 'Cloudinary'
       }
     });
 
@@ -896,10 +930,11 @@ app.listen(PORT, () => {
   console.log(`✓ FreightChat Pro API Running`);
   console.log(`📍 Port: ${PORT}`);
   console.log(`🌐 Health: http://localhost:${PORT}/`);
-  console.log(`📦 Version: 5.2.0 - Free Deployment Ready`);
+  console.log(`📦 Version: 5.4.0 - Cloudinary Integration`);
   console.log(`🤖 Agent Status: ${shippingAgent ? '✓ Ready' : '⚠ Initializing...'}`);
   console.log(`📄 Invoice Processing: ✓ Active`);
-  console.log(`☁️  Redis: Upstash Connected`);
-  console.log(`🚀 Deployment: Render Free Tier`);
+  console.log(`☁️  Storage: Cloudinary Connected`);
+  console.log(`💾 Redis: Upstash Connected`);
+  console.log(`🚀 Deployment: Render Free Tier Ready`);
   console.log('========================================');
 });
