@@ -1,18 +1,19 @@
 services:
-  # API Service (Web)
   - type: web
     name: freightchat-api
     env: node
     region: oregon
     plan: free
     buildCommand: npm install
-    startCommand: node index.js
+    startCommand: npm run dev
     healthCheckPath: /
     envVars:
       - key: NODE_ENV
         value: production
       - key: PORT
         value: 8000
+      - key: WORKER_PORT
+        value: 8001
       - key: OPENAI_API_KEY
         sync: false
       - key: SUPABASE_URL
@@ -30,32 +31,4 @@ services:
       - key: JWT_SECRET
         sync: false
       - key: FRONTEND_URL
-        sync: false
-
-  # Worker Service (Background Worker)
-  - type: worker
-    name: freightchat-worker
-    env: node
-    region: oregon
-    plan: free
-    buildCommand: npm install
-    startCommand: node worker.js
-    envVars:
-      - key: NODE_ENV
-        value: production
-      - key: WORKER_PORT
-        value: 8001
-      - key: OPENAI_API_KEY
-        sync: false
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_ANON_KEY
-        sync: false
-      - key: QDRANT_URL
-        sync: false
-      - key: QDRANT_API_KEY
-        sync: false
-      - key: UPSTASH_REDIS_REST_URL
-        sync: false
-      - key: UPSTASH_REDIS_REST_TOKEN
         sync: false
