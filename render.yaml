@@ -4,8 +4,8 @@ services:
     env: node
     region: oregon
     plan: free
-    buildCommand: npm install
-    startCommand: npm run dev
+    buildCommand: pnpm install
+    startCommand: pnpm run dev
     healthCheckPath: /
     envVars:
       - key: NODE_ENV
