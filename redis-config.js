@@ -10,26 +10,43 @@ export function createRedisConnection() {
     if (process.env.UPSTASH_REDIS_REST_URL) {
       console.log('[Redis] Connecting to Upstash Redis...');
       
-      // Parse Upstash REST URL
-      const restUrl = process.env.UPSTASH_REDIS_REST_URL;
-      const url = new URL(restUrl.replace('redis://', 'http://'));
+      // Clean the URL (remove any quotes)
+      let restUrl = process.env.UPSTASH_REDIS_REST_URL.trim();
+      restUrl = restUrl.replace(/^["']|["']$/g, ''); // Remove surrounding quotes
+      
+      // Parse URL - Upstash gives redis:// format, convert to use with ioredis
+      const urlObj = new URL(restUrl);
       
       const connection = new IORedis({
-        host: url.hostname,
-        port: parseInt(url.port) || 6379,
-        password: process.env.UPSTASH_REDIS_REST_TOKEN,
+        host: urlObj.hostname,
+        port: parseInt(urlObj.port) || 6379,
+        password: process.env.UPSTASH_REDIS_REST_TOKEN?.replace(/^["']|["']$/g, ''),
         tls: {
           rejectUnauthorized: false
         },
         maxRetriesPerRequest: null,
         enableReadyCheck: false,
+        // CRITICAL: Disable CLIENT SETINFO to prevent errors with Upstash
+        showFriendlyErrorStack: false,
+        enableOfflineQueue: true,
+        // Don't send CLIENT SETNAME/SETINFO commands
+        connectionName: null,
         retryStrategy: (times) => {
           const delay = Math.min(times * 50, 2000);
           return delay;
         },
         reconnectOnError: (err) => {
-          console.log('[Redis] Reconnect on error:', err.message);
-          return true;
+          // Only reconnect on network errors, not command errors
+          const targetError = /READONLY|ETIMEDOUT|ECONNRESET|ENOTFOUND/;
+          if (targetError.test(err.message)) {
+            console.log('[Redis] Reconnecting due to:', err.message);
+            return true;
+          }
+          // Ignore CLIENT SETINFO errors - don't reconnect
+          if (err.message.includes('CLIENT SETINFO')) {
+            return false;
+          }
+          return false;
         }
       });
 
@@ -38,7 +55,10 @@ export function createRedisConnection() {
       });
 
       connection.on('error', (err) => {
-        console.error('[Redis] Connection error:', err.message);
+        // Suppress CLIENT SETINFO error logs
+        if (!err.message.includes('CLIENT SETINFO')) {
+          console.error('[Redis] Connection error:', err.message);
+        }
       });
 
       return connection;
@@ -50,6 +70,7 @@ export function createRedisConnection() {
       return new IORedis(process.env.REDIS_URL, {
         maxRetriesPerRequest: null,
         enableReadyCheck: false,
+        connectionName: null, // Disable CLIENT SETINFO
         tls: process.env.REDIS_TLS === 'true' ? { rejectUnauthorized: false } : undefined
       });
     }
@@ -61,7 +82,8 @@ export function createRedisConnection() {
       port: parseInt(process.env.REDIS_PORT) || 6379,
       password: process.env.REDIS_PASSWORD || undefined,
       maxRetriesPerRequest: null,
-      enableReadyCheck: false
+      enableReadyCheck: false,
+      connectionName: null // Disable CLIENT SETINFO
     });
 
   } catch (error) {
@@ -70,5 +92,4 @@ export function createRedisConnection() {
   }
 }
 
-// Export singleton connection
 export const redisConnection = createRedisConnection();
