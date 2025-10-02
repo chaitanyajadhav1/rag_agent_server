@@ -55,27 +55,15 @@ const invoiceQueue = new Queue('invoice-upload-queue', {
 
 console.log('✓ BullMQ queues initialized with Upstash Redis');
 
-// FIXED: Cloudinary storage configuration with proper signature handling
+// FIXED: Cloudinary storage configuration - let Cloudinary auto-generate public_id
 const cloudinaryStorage = new CloudinaryStorage({
   cloudinary: cloudinary,
-  params: async (req, file) => {
-    // Generate a clean public_id without special characters
-    const timestamp = Date.now();
-    const randomStr = crypto.randomBytes(4).toString('hex');
-    // Remove file extension and sanitize filename
-    const sanitizedName = file.originalname
-      .replace(/\.pdf$/i, '')
-      .replace(/[^a-zA-Z0-9]/g, '_')
-      .substring(0, 50); // Limit length
-    
-    const publicId = `${timestamp}_${randomStr}_${sanitizedName}`;
-    
-    return {
-      folder: 'freightchat-documents',
-      resource_type: 'raw',
-      allowed_formats: ['pdf'],
-      public_id: publicId,
-    };
+  params: {
+    folder: 'freightchat-documents',
+    resource_type: 'raw',
+    allowed_formats: ['pdf'],
+    use_filename: true,
+    unique_filename: true,
   },
 });
 
