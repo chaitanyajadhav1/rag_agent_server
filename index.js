@@ -55,17 +55,27 @@ const invoiceQueue = new Queue('invoice-upload-queue', {
 
 console.log('✓ BullMQ queues initialized with Upstash Redis');
 
-// Cloudinary storage configuration
+// FIXED: Cloudinary storage configuration with proper signature handling
 const cloudinaryStorage = new CloudinaryStorage({
   cloudinary: cloudinary,
-  params: {
-    folder: 'freightchat-documents',
-    resource_type: 'raw',
-    allowed_formats: ['pdf'],
-    public_id: (req, file) => {
-      const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-      return `${uniqueSuffix}-${file.originalname.replace(/\.pdf$/i, '')}`;
-    },
+  params: async (req, file) => {
+    // Generate a clean public_id without special characters
+    const timestamp = Date.now();
+    const randomStr = crypto.randomBytes(4).toString('hex');
+    // Remove file extension and sanitize filename
+    const sanitizedName = file.originalname
+      .replace(/\.pdf$/i, '')
+      .replace(/[^a-zA-Z0-9]/g, '_')
+      .substring(0, 50); // Limit length
+    
+    const publicId = `${timestamp}_${randomStr}_${sanitizedName}`;
+    
+    return {
+      folder: 'freightchat-documents',
+      resource_type: 'raw',
+      allowed_formats: ['pdf'],
+      public_id: publicId,
+    };
   },
 });
 
@@ -329,7 +339,7 @@ app.get('/', async (req, res) => {
       architecture: 'LangGraph Multi-Agent',
       deployment: 'Render Free Tier Ready',
       features: ['PDF Chat', 'AI Shipping Agent', 'Real-time Tracking', 'Invoice Processing'],
-      version: '5.4.0-cloudinary'
+      version: '5.4.1-cloudinary-fixed'
     });
   } catch (error) {
     return res.status(500).json({
@@ -930,7 +940,7 @@ app.listen(PORT, () => {
   console.log(`✓ FreightChat Pro API Running`);
   console.log(`📍 Port: ${PORT}`);
   console.log(`🌐 Health: http://localhost:${PORT}/`);
-  console.log(`📦 Version: 5.4.0 - Cloudinary Integration`);
+  console.log(`📦 Version: 5.4.1 - Cloudinary Signature Fixed`);
   console.log(`🤖 Agent Status: ${shippingAgent ? '✓ Ready' : '⚠ Initializing...'}`);
   console.log(`📄 Invoice Processing: ✓ Active`);
   console.log(`☁️  Storage: Cloudinary Connected`);
