@@ -9,7 +9,9 @@ import express from 'express';
 import cors from 'cors';
 import fs from 'fs';
 import dotenv from 'dotenv';
+import axios from 'axios';
 import { createClient } from '@supabase/supabase-js';
+import cloudinary from './cloudinary-config.js';
 import { redisConnection } from './redis-config.js';
 
 dotenv.config();
@@ -245,27 +247,36 @@ IMPORTANT: Return ONLY valid JSON. No markdown, no code blocks, just pure JSON.`
   }
 }
 
-// ========== PDF PROCESSING WORKER ==========
+// ========== PDF PROCESSING WORKER (WITH CLOUDINARY) ==========
 
 const pdfWorker = new Worker(
   'file-upload-queue',
   async (job) => {
     const startTime = Date.now();
+    let tempPath = null;
     
     try {
       console.log(`[PDF Worker] Processing job ${job.id}`);
       const data = typeof job.data === 'string' ? JSON.parse(job.data) : job.data;
 
-      const { path: filePath, filename, collectionName, strategy, userId, documentId } = data;
+      const { cloudinaryUrl, cloudinaryPublicId, filename, collectionName, strategy, userId, documentId } = data;
 
-      if (!fs.existsSync(filePath)) {
-        throw new Error(`File not found: ${filePath}`);
-      }
+      console.log(`[PDF Worker] Downloading from Cloudinary: ${filename}`);
 
-      const fileSize = fs.statSync(filePath).size;
-      console.log(`[PDF Worker] Loading ${filename} (${(fileSize / 1024).toFixed(2)} KB)`);
+      // Download PDF from Cloudinary
+      const response = await axios.get(cloudinaryUrl, { 
+        responseType: 'arraybuffer',
+        timeout: 30000 // 30 second timeout
+      });
 
-      const loader = new PDFLoader(filePath);
+      // Save to temporary file in /tmp (Render provides /tmp space)
+      tempPath = `/tmp/${Date.now()}-${filename}`;
+      fs.writeFileSync(tempPath, response.data);
+
+      const fileSize = fs.statSync(tempPath).size;
+      console.log(`[PDF Worker] Downloaded ${filename} (${(fileSize / 1024).toFixed(2)} KB)`);
+
+      const loader = new PDFLoader(tempPath);
       const docs = await loader.load();
       console.log(`[PDF Worker] Loaded ${docs.length} pages`);
 
@@ -303,7 +314,8 @@ const pdfWorker = new Worker(
             sentiment: aiAnalysis.sentiment,
             entities: aiAnalysis.keyEntities,
             fileSize,
-            processingVersion: '5.3.0-supabase-only'
+            cloudinaryUrl,
+            processingVersion: '5.4.0-cloudinary'
           },
         });
       });
@@ -365,7 +377,7 @@ const pdfWorker = new Worker(
         }
       }
 
-      // ========== UPDATE SUPABASE DOCUMENT RECORD ==========
+      // Update Supabase
       try {
         const { error: updateError } = await supabase
           .from('documents')
@@ -380,9 +392,11 @@ const pdfWorker = new Worker(
             topics: aiAnalysis.topics,
             sentiment: aiAnalysis.sentiment,
             key_entities: aiAnalysis.keyEntities,
+            cloudinary_url: cloudinaryUrl,
+            cloudinary_public_id: cloudinaryPublicId,
             processed: true,
             processed_at: new Date().toISOString(),
-            processing_version: '5.3.0-supabase-only'
+            processing_version: '5.4.0-cloudinary'
           })
           .eq('document_id', documentId);
 
@@ -395,12 +409,20 @@ const pdfWorker = new Worker(
         console.warn(`[PDF Worker] Supabase update error:`, supabaseError.message);
       }
 
-      try {
-        fs.unlinkSync(filePath);
-        console.log(`[PDF Worker] Cleaned up file: ${filePath}`);
-      } catch (err) {
-        console.warn(`[PDF Worker] Could not delete file: ${err.message}`);
+      // Clean up temp file
+      if (tempPath && fs.existsSync(tempPath)) {
+        fs.unlinkSync(tempPath);
+        console.log(`[PDF Worker] ✓ Cleaned up temp file`);
       }
+
+      // Optionally delete from Cloudinary after processing
+      // Uncomment if you want to save Cloudinary storage space
+      // try {
+      //   await cloudinary.uploader.destroy(cloudinaryPublicId, { resource_type: 'raw' });
+      //   console.log(`[PDF Worker] ✓ Deleted from Cloudinary: ${cloudinaryPublicId}`);
+      // } catch (err) {
+      //   console.warn(`[PDF Worker] Could not delete from Cloudinary:`, err.message);
+      // }
 
       const processingTime = Date.now() - startTime;
       console.log(`[PDF Worker] ✓ Completed in ${processingTime}ms`);
@@ -413,18 +435,18 @@ const pdfWorker = new Worker(
         strategy,
         aiAnalysis,
         processingTime,
-        version: '5.3.0-supabase-only'
+        version: '5.4.0-cloudinary'
       };
 
     } catch (err) {
       console.error(`[PDF Worker] Job ${job.id} failed:`, err);
       
-      try {
-        const filePath = typeof job.data === 'string' ? JSON.parse(job.data).path : job.data.path;
-        if (filePath && fs.existsSync(filePath)) {
-          fs.unlinkSync(filePath);
-        }
-      } catch {}
+      // Clean up temp file on error
+      if (tempPath && fs.existsSync(tempPath)) {
+        try {
+          fs.unlinkSync(tempPath);
+        } catch {}
+      }
       
       throw err;
     }
@@ -448,12 +470,13 @@ const pdfWorker = new Worker(
   }
 );
 
-// ========== INVOICE PROCESSING WORKER ==========
+// ========== INVOICE PROCESSING WORKER (WITH CLOUDINARY) ==========
 
 const invoiceWorker = new Worker(
   'invoice-upload-queue',
   async (job) => {
     const startTime = Date.now();
+    let tempPath = null;
     
     try {
       console.log(`\n========================================`);
@@ -461,20 +484,25 @@ const invoiceWorker = new Worker(
       console.log(`========================================`);
       
       const data = typeof job.data === 'string' ? JSON.parse(job.data) : job.data;
-      const { path: filePath, filename, invoiceId, userId, sessionId, bookingId } = data;
+      const { cloudinaryUrl, cloudinaryPublicId, filename, invoiceId, userId, sessionId, bookingId } = data;
 
       console.log(`[Invoice Worker] File: ${filename}`);
       console.log(`[Invoice Worker] Invoice ID: ${invoiceId}`);
 
-      if (!fs.existsSync(filePath)) {
-        throw new Error(`File not found: ${filePath}`);
-      }
+      console.log(`[Invoice Worker] Downloading from Cloudinary...`);
+      const response = await axios.get(cloudinaryUrl, { 
+        responseType: 'arraybuffer',
+        timeout: 30000
+      });
 
-      const fileSize = fs.statSync(filePath).size;
+      tempPath = `/tmp/${Date.now()}-${filename}`;
+      fs.writeFileSync(tempPath, response.data);
+
+      const fileSize = fs.statSync(tempPath).size;
       console.log(`[Invoice Worker] File size: ${(fileSize / 1024).toFixed(2)} KB`);
 
       console.log(`[Invoice Worker] Loading PDF...`);
-      const loader = new PDFLoader(filePath);
+      const loader = new PDFLoader(tempPath);
       const docs = await loader.load();
       console.log(`[Invoice Worker] ✓ Loaded ${docs.length} pages`);
 
@@ -506,6 +534,8 @@ const invoiceWorker = new Worker(
           document_type: analysis.documentType,
           extracted_data: analysis,
           total_pages: docs.length,
+          cloudinary_url: cloudinaryUrl,
+          cloudinary_public_id: cloudinaryPublicId,
           processed_at: new Date().toISOString()
         })
         .eq('invoice_id', invoiceId)
@@ -540,7 +570,8 @@ const invoiceWorker = new Worker(
             analysis: analysis,
             processedAt: new Date().toISOString(),
             fileSize,
-            version: '5.3.0-supabase-only'
+            cloudinaryUrl,
+            version: '5.4.0-cloudinary'
           },
         });
 
@@ -561,11 +592,10 @@ const invoiceWorker = new Worker(
         console.warn(`[Invoice Worker] Vector storage failed:`, vectorError.message);
       }
 
-      try {
-        fs.unlinkSync(filePath);
-        console.log(`[Invoice Worker] ✓ Cleaned up file`);
-      } catch (err) {
-        console.warn(`[Invoice Worker] Could not delete file: ${err.message}`);
+      // Clean up temp file
+      if (tempPath && fs.existsSync(tempPath)) {
+        fs.unlinkSync(tempPath);
+        console.log(`[Invoice Worker] ✓ Cleaned up temp file`);
       }
 
       const processingTime = Date.now() - startTime;
@@ -580,7 +610,7 @@ const invoiceWorker = new Worker(
         analysis,
         collectionName: `invoices_${userId}`,
         processingTime,
-        version: '5.3.0-supabase-only'
+        version: '5.4.0-cloudinary'
       };
 
     } catch (err) {
@@ -603,12 +633,12 @@ const invoiceWorker = new Worker(
         console.error(`[Invoice Worker] Could not update database:`, dbErr.message);
       }
       
-      try {
-        const filePath = typeof job.data === 'string' ? JSON.parse(job.data).path : job.data.path;
-        if (filePath && fs.existsSync(filePath)) {
-          fs.unlinkSync(filePath);
-        }
-      } catch {}
+      // Clean up temp file on error
+      if (tempPath && fs.existsSync(tempPath)) {
+        try {
+          fs.unlinkSync(tempPath);
+        } catch {}
+      }
       
       throw err;
     }
@@ -650,15 +680,7 @@ invoiceWorker.on('failed', (job, err) => {
   console.error(`[Invoice Worker] ✗ Job ${job?.id} failed: ${err.message}`);
 });
 
-// ========== HEALTH MONITORING ==========
-
-// setInterval(() => {
-//   const pdfStatus = pdfWorker.isRunning() ? '✓ Running' : '✗ Stopped';
-//   const invoiceStatus = invoiceWorker.isRunning() ? '✓ Running' : '✗ Stopped';
-//   console.log(`[Workers] PDF: ${pdfStatus} | Invoice: ${invoiceStatus}`);
-// }, 300000);
-
-// ========== HEALTH CHECK API WITH CORS ==========
+// ========== HEALTH CHECK API ==========
 
 const workerApp = express();
 const WORKER_PORT = process.env.WORKER_PORT || 8001;
@@ -689,16 +711,13 @@ workerApp.get('/health', (req, res) => {
         concurrency: 1
       }
     ],
-    storage: 'Supabase (Qdrant for vectors)',
-    cache: 'None (direct Supabase queries)',
+    storage: 'Cloudinary + Supabase + Qdrant',
     deployment: 'Render Free Tier',
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
-    version: '5.3.0-supabase-only'
+    version: '5.4.0-cloudinary'
   });
 });
-
-// ========== SUPABASE DATA RETRIEVAL ENDPOINTS ==========
 
 workerApp.get('/api/invoice/:invoiceId', async (req, res) => {
   try {
@@ -736,71 +755,23 @@ workerApp.get('/api/document/:documentId', async (req, res) => {
   }
 });
 
-workerApp.get('/api/user/:userId/invoices', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { data, error } = await supabase
-      .from('invoices')
-      .select('invoice_id, filename, document_type, uploaded_at, processed, extracted_data')
-      .eq('user_id', userId)
-      .order('uploaded_at', { ascending: false });
-    
-    if (error) throw error;
-    
-    res.json({ 
-      userId, 
-      invoices: data || [],
-      count: data?.length || 0
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-workerApp.get('/api/user/:userId/documents', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { data, error } = await supabase
-      .from('documents')
-      .select('document_id, filename, document_type, uploaded_at, processed, total_pages, total_chunks')
-      .eq('user_id', userId)
-      .order('uploaded_at', { ascending: false });
-    
-    if (error) throw error;
-    
-    res.json({ 
-      userId, 
-      documents: data || [],
-      count: data?.length || 0
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
 workerApp.listen(WORKER_PORT, () => {
   console.log('========================================');
   console.log('FreightChat Pro Workers Started');
   console.log('========================================');
-  console.log(`Version: 5.3.0-supabase-only`);
+  console.log(`Version: 5.4.0-cloudinary`);
   console.log(`Health Check: http://localhost:${WORKER_PORT}/health`);
-  console.log(`Storage: Supabase (single source of truth)`);
+  console.log(`Storage: Cloudinary (persistent file storage)`);
+  console.log(`Database: Supabase`);
   console.log(`Vectors: Qdrant`);
-  console.log(`Queue: BullMQ (Redis for jobs only)`);
+  console.log(`Queue: BullMQ (Redis)`);
   console.log(`Deployment: Render Free Tier Ready`);
-  console.log(`CORS: Enabled for localhost:3000, localhost:3001`);
   console.log('========================================');
   console.log('Active Workers:');
   console.log('  ✓ PDF Processing (2 concurrent)');
   console.log('  ✓ Invoice Processing (1 concurrent)');
   console.log('========================================');
-  console.log('API Endpoints:');
-  console.log('  GET /api/invoice/:invoiceId');
-  console.log('  GET /api/document/:documentId');
-  console.log('  GET /api/user/:userId/invoices');
-  console.log('  GET /api/user/:userId/documents');
-  console.log('========================================');
-  console.log('Ready to process jobs...');
+  console.log('Ready to process jobs from Cloudinary...');
 });
 
 // ========== GRACEFUL SHUTDOWN ==========
