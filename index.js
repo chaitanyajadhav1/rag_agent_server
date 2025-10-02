@@ -13,7 +13,7 @@ import { MemorySaver } from '@langchain/langgraph';
 import { createShippingAgent, ShippingAgentExecutor } from './workflow.js';
 import { redisConnection } from './redis-config.js';
 import cloudinary from './cloudinary-config.js';
-import { CloudinaryStorage } from 'multer-storage-cloudinary';
+import streamifier from 'streamifier';
 
 dotenv.config();
 
@@ -55,21 +55,11 @@ const invoiceQueue = new Queue('invoice-upload-queue', {
 
 console.log('✓ BullMQ queues initialized with Upstash Redis');
 
-// FIXED: Cloudinary storage configuration - let Cloudinary auto-generate public_id
-const cloudinaryStorage = new CloudinaryStorage({
-  cloudinary: cloudinary,
-  params: {
-    folder: 'freightchat-documents',
-    resource_type: 'raw',
-    allowed_formats: ['pdf'],
-    use_filename: true,
-    unique_filename: true,
-  },
-});
+// Use memory storage instead of multer-storage-cloudinary
+const storage = multer.memoryStorage();
 
-// Multer upload configuration with Cloudinary
 const upload = multer({ 
-  storage: cloudinaryStorage,
+  storage: storage,
   fileFilter: (req, file, cb) => {
     if (file.mimetype === 'application/pdf') {
       cb(null, true);
@@ -79,6 +69,25 @@ const upload = multer({
   },
   limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
 });
+
+// Helper function to upload buffer to Cloudinary
+const uploadToCloudinary = (buffer, filename) => {
+  return new Promise((resolve, reject) => {
+    const uploadStream = cloudinary.uploader.upload_stream(
+      {
+        folder: 'freightchat-documents',
+        resource_type: 'raw',
+        public_id: `${Date.now()}_${filename.replace(/\.pdf$/i, '').replace(/[^a-zA-Z0-9]/g, '_')}`,
+      },
+      (error, result) => {
+        if (error) reject(error);
+        else resolve(result);
+      }
+    );
+    
+    streamifier.createReadStream(buffer).pipe(uploadStream);
+  });
+};
 
 const app = express();
 
@@ -327,7 +336,7 @@ app.get('/', async (req, res) => {
       architecture: 'LangGraph Multi-Agent',
       deployment: 'Render Free Tier Ready',
       features: ['PDF Chat', 'AI Shipping Agent', 'Real-time Tracking', 'Invoice Processing'],
-      version: '5.4.1-cloudinary-fixed'
+      version: '5.5.0-direct-cloudinary-upload'
     });
   } catch (error) {
     return res.status(500).json({
@@ -437,9 +446,11 @@ app.post('/upload/pdf', verifyUserToken, upload.single('pdf'), async (req, res) 
     const documentId = crypto.randomBytes(16).toString('hex');
     const strategy = req.body.strategy || 'user';
     
-    // Cloudinary info from multer-storage-cloudinary
-    const cloudinaryUrl = req.file.path; // Full Cloudinary URL
-    const cloudinaryPublicId = req.file.filename; // Cloudinary public_id
+    // Upload to Cloudinary
+    const cloudinaryResult = await uploadToCloudinary(req.file.buffer, req.file.originalname);
+    
+    const cloudinaryUrl = cloudinaryResult.secure_url;
+    const cloudinaryPublicId = cloudinaryResult.public_id;
     
     let collectionName;
     switch (strategy) {
@@ -510,9 +521,11 @@ app.post('/agent/shipping/upload-invoice', verifyUserToken, upload.single('invoi
     const userId = req.userId;
     const invoiceId = crypto.randomBytes(16).toString('hex');
     
-    // Cloudinary info
-    const cloudinaryUrl = req.file.path;
-    const cloudinaryPublicId = req.file.filename;
+    // Upload to Cloudinary
+    const cloudinaryResult = await uploadToCloudinary(req.file.buffer, req.file.originalname);
+    
+    const cloudinaryUrl = cloudinaryResult.secure_url;
+    const cloudinaryPublicId = cloudinaryResult.public_id;
     const fileSize = req.file.size;
 
     const invoiceRecord = await createInvoiceRecord({
